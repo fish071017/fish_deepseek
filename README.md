@@ -156,3 +156,12 @@ URL 支持 hash 直达，方便分享和调试：
 
 改完代码记得同时改两个地方：`index.html` 的 `BUILD` 和 `sw.js` 的 `VERSION`。
 
+### 真机触摸验证
+
+`node _check/mobile.js` 用 Chrome DevTools Protocol 驱动真实 Edge，
+在 4 种视口下派发真实触摸事件。它做的是**状态断言**（倒水后盘面变没变、
+消箭头数减没减、得分涨没涨），不是截图比对，所以能抓到逻辑 bug。
+
+写这类脚本最容易踩的两个坑（我都踩过，见上面第 8 条）：
+反算坐标必须用应用自己的 `layoutRect.dpr`，且基准量要统一。
+

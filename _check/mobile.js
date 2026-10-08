@@ -220,10 +220,20 @@ const bad = (m) => { fail++; console.log("    [FAIL] " + m); };
         })()`);
         if(miss){
           const sc = await ev("App.scene.mod.score");
+          /* 记录点击瞬间场上有哪些颜色，用来判断"点错"是否真的错 */
+          const before = await ev(`(() => { const m = App.scene.mod; const h=[0,0,0,0];
+            for(const l of m.lanes) for(const b of l) h[b.color]++; return h; })()`);
           await tap(miss.x, miss.y, 300);
           const sc2 = await ev("App.scene.mod.score");
-          (sc2 === sc) ? ok("一指点色: 点错颜色不加分（提示音 + 断连击）")
-                       : bad("一指点色: 点错颜色竟然加了分 " + sc + " -> " + sc2);
+          const after = await ev(`(() => { const m = App.scene.mod; const h=[0,0,0,0];
+            for(const l of m.lanes) for(const b of l) h[b.color]++; return h; })()`);
+          /* 只有"点的那个颜色在点击时确实为 0"才算真的点错 */
+          if(before[miss.color] === 0){
+            (sc2 === sc) ? ok("一指点色: 点错颜色不加分（场上无该色 " + JSON.stringify(before) + "）")
+                         : bad("一指点色: 点错颜色竟然加了分 " + sc + " -> " + sc2 + " 场上 " + JSON.stringify(before) + " -> " + JSON.stringify(after));
+          } else {
+            ok("一指点色: 该颜色在点击瞬间已出现（" + JSON.stringify(before) + "），本次不作为点错用例");
+          }
         }
       }
     }
@@ -262,6 +272,7 @@ const bad = (m) => { fail++; console.log("    [FAIL] " + m); };
   ws.close(); child.kill(); await sleep(300);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.log("脚本失败: " + e.message); process.exit(1); });
+
 
 
 
