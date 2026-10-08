@@ -94,25 +94,45 @@ const ev = (expr) => vm.runInContext(expr, ctxVm);
 console.log("Node " + process.version + " 验证（使用 index.html 真实实现）");
 console.log("脚本加载: OK   W=" + ev("W") + " H=" + ev("H"));
 
-/* ================= 1. 试管：贪心可解性 ================= */
+/* ================= 1. 试管：开局必须"未完成" + 贪心可解 ================= */
 (function testSort(){
-  console.log("\n=== 像素试管：贪心求解通过率 ===");
+  console.log("\n=== 像素试管：开局状态 + 贪心求解通过率 ===");
   let bad = 0;
   for(let lv = 1; lv <= 14; lv++){
-    ev(`__T = { ok: 0, total: 0, tubes: 0, lv: ${lv} }`);
     const r = ev(`(function(){
+      let solvedAtStart = 0, solvedByGreedy = 0, total = 0, tubes = 0, legalSum = 0;
       for(let trial = 0; trial < 60; trial++){
         const m = Games.sort.create();
-        m.layout = function(){};
-        m.level = __T.lv;
+        m.level = ${lv};
+        /* 注意：先 buildLevel（它会调用 this.layout()），成功后再把 layout 置空。
+           之前把顺序写反，等于绕过了真实路径，才漏掉了"开局即已完成"这个 bug。 */
         m.buildLevel();
+        m.layout = function(){};
         m.app = { win(){}, end(){}, go(){}, scene: null };
-        __T.tubes = m.tubes.length;
-        __T.total++;
-        let guard = 0, solved = false;
-        while(guard++ < 4000){
-          if(m.isSolved()){ solved = true; break; }
-          const cands = [], n = m.tubes.length;
+        tubes = m.tubes.length;
+        total++;
+
+        /* 关键不变式：开局绝不能是已完成状态 */
+        if(m.isSolved()) solvedAtStart++;
+
+        /* 数一下开局有多少合法走法 */
+        let legal = 0;
+        const n = m.tubes.length;
+        for(let f = 0; f < n; f++) for(let t = 0; t < n; t++){
+          if(f === t) continue;
+          const from = m.tubes[f], to = m.tubes[t];
+          if(!from.blocks.length || to.blocks.length >= m.CAP || m.isDone(from)) continue;
+          const cf = m.topColor(from), ct = m.topColor(to);
+          if(to.blocks.length > 0 && cf !== ct) continue;
+          legal++;
+        }
+        legalSum += legal;
+
+        /* 贪心求解 */
+        let guard = 0;
+        while(guard++ < 6000){
+          if(m.isSolved()){ solvedByGreedy++; break; }
+          const cands = [];
           for(let f = 0; f < n; f++) for(let t = 0; t < n; t++){
             if(f === t) continue;
             const from = m.tubes[f], to = m.tubes[t];
@@ -128,16 +148,18 @@ console.log("脚本加载: OK   W=" + ev("W") + " H=" + ev("H"));
           const cnt = Math.min(m.topRun(from), m.CAP - to.blocks.length);
           for(let i = 0; i < cnt; i++) to.blocks.push(from.blocks.pop());
         }
-        if(solved) __T.ok++;
       }
-      return { ok: __T.ok, total: __T.total, tubes: __T.tubes };
+      return { solvedAtStart, solvedByGreedy, total, tubes, avgLegal: legalSum / total };
     })()`);
-    const pct = (r.ok / r.total * 100).toFixed(1);
-    if(r.ok !== r.total) bad++;
+    const okStart = r.solvedAtStart === 0;
+    const okSolve = r.solvedByGreedy === r.total;
+    if(!okStart || !okSolve) bad++;
     console.log("  第 " + String(lv).padStart(2) + " 关 | 试管 " + String(r.tubes).padStart(2) +
-                " | 解出 " + pct + "%" + (r.ok === r.total ? "  [OK]" : "  [FAIL]"));
+                " | 开局已完成 " + r.solvedAtStart + "/" + r.total + (okStart ? " [OK]" : " [FAIL]") +
+                " | 开局均 " + r.avgLegal.toFixed(1) + " 种走法" +
+                " | 解出 " + (r.solvedByGreedy / r.total * 100).toFixed(1) + "%" + (okSolve ? " [OK]" : " [FAIL]"));
   }
-  console.log(bad === 0 ? "  >>> 全部关卡可解" : "  >>> 有 " + bad + " 关存在问题");
+  console.log(bad === 0 ? "  >>> 开局都未完成，且全部可解" : "  >>> 有 " + bad + " 关存在问题");
 })();
 
 /* ================= 2. 箭头：零死局 ================= */

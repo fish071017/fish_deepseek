@@ -9,8 +9,10 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="像素街机">
-<link rel="manifest" href="./manifest.webmanifest">
+<link rel="icon" href="./favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="./icon-192.png">
 <link rel="apple-touch-icon" href="./icon-192.png">
+<link rel="manifest" href="./manifest.webmanifest">
 <style>
   :root{
     --bg:#0b0b14;
@@ -293,21 +295,36 @@ function block(x, y, w, h, color, light, dark){
   if(dark){ px(x, y + h - 2, w, 2, dark); px(x + w - 2, y, 2, h, dark); }
 }
 
-/* ============================ 输入 ============================ */
+/* ============================ 输入 ============================
+   重要：事件回调与渲染循环是异步的，不能靠"帧末无条件清空"来消费点击。
+   这里的协议是：
+     · 事件发生 → 推入 pending（等待队列，不回退）
+     · 每次 update 之前 → pending 快照进 taps
+     · update 之后 → 清空 taps，同时把已消费的从 pending 中移除
+   这样无论一帧里 rAF 被调用几次、浏览器怎么节流，点击都不会被丢掉。 */
 const Input = {
-  taps: [],            // 本帧点击 {x,y,t}
+  pending: [],         // 事件队列（跨帧保留，直到被消费）
+  taps: [],            // 本帧可供读取的点击
   down: false,
   downPos: { x: 0, y: 0 },
+  curPos: { x: 0, y: 0 },
   downTime: 0,
   downDur: 0,          // 按住时长（秒）
   released: false,
   releaseDur: 0,
+  releasePos: { x: 0, y: 0 },
+  /* 每帧开始：把等待队列快照给场景读取 */
+  beginFrame(){
+    this.taps = this.pending.slice();
+  },
   _start(ev){
     Sfx.init(); Sfx.resume();
     const t = ev.touches ? ev.touches[0] : ev;
     const p = screenToLogical(t.clientX, t.clientY);
     this.down = true; this.downPos = p; this.downTime = performance.now();
     this.downDur = 0; this.pressed = true;
+    /* 供长按类玩法（像素跳跃）每帧读取当前指针位置 */
+    this.curPos = p;
   },
   _move(ev){
     if(!this.down) return;
@@ -318,12 +335,22 @@ const Input = {
     if(!this.down) return;
     this.down = false;
     this.downDur = (performance.now() - this.downTime) / 1000;
-    this.taps.push({ x: this.downPos.x, y: this.downPos.y, dur: this.downDur });
+    this.pending.push({ x: this.downPos.x, y: this.downPos.y, dur: this.downDur });
     this.released = true;
     this.releaseDur = this.downDur;
     this.releasePos = this.downPos;
   },
-  endFrame(){ this.taps.length = 0; this.released = false; this.pressed = false; }
+  /* 每帧结束：清掉已消费的点击，pending 里只保留尚未处理过的 */
+  endFrame(){
+    if(this.pending.length){
+      /* taps 是本帧快照，两者的交集即"已消费"；直接清空 pending 即可，
+         因为 beginFrame 已把全部内容交给本帧了。 */
+      this.pending.length = 0;
+    }
+    this.taps.length = 0;
+    this.released = false;
+    this.pressed = false;
+  }
 };
 canvas.addEventListener("touchstart", e => { e.preventDefault(); Input._start(e); }, { passive: false });
 canvas.addEventListener("touchmove",  e => { e.preventDefault(); Input._move(e); },  { passive: false });
@@ -525,6 +552,10 @@ Scenes.game = {
     this.advancing = false;
     this.startLevel = p.level || 1;
     this.mod.level = this.startLevel;
+    /* 顶栏按钮位置在这里就定好。draw() 会读它，而场景切换是同步的
+       （home.update 里调用 App.go → 同一帧就 draw），若不在此初始化，
+       draw() 会在 update() 之前跑到，读到 undefined 直接抛异常让主循环挂掉。 */
+    this.backRect = { x: 12, y: 10, w: 44, h: 34 };
     if(this.mod.init) this.mod.init(this);
   },
   exit(){ if(this.mod && this.mod.dispose) this.mod.dispose(); },
@@ -585,7 +616,6 @@ Scenes.game = {
     }
     /* 顶栏返回按钮（任何时刻，续关过渡中除外） */
     if(this.advancing) return;
-    this.backRect = { x: 12, y: 10, w: 44, h: 34 };
     for(const tp of Input.taps){
       if(tp.x >= this.backRect.x && tp.x <= this.backRect.x + this.backRect.w &&
          tp.y >= this.backRect.y && tp.y <= this.backRect.y + this.backRect.h){
@@ -633,14 +663,15 @@ Scenes.game = {
 
     /* 顶栏：返回键在左，游戏名+最佳紧邻其右，状态读数靠右。
        三者水平分区，互不重叠（此前居中的标题会被右侧读数压住）。 */
-    panel(this.backRect.x, this.backRect.y, this.backRect.w, this.backRect.h, "#16162a", "#3a3a5c", 2);
-    text("‹", this.backRect.x + 21, this.backRect.y + 17, 22, "#e8e8f0", "center");
-    const nameX = this.backRect.x + this.backRect.w + 10;
-    text(this.meta.name, nameX, this.backRect.y + 13, 14, "#e8e8f0", "left");
+    const br = this.backRect || (this.backRect = { x: 12, y: 10, w: 44, h: 34 });
+    panel(br.x, br.y, br.w, br.h, "#16162a", "#3a3a5c", 2);
+    text("‹", br.x + 21, br.y + 17, 22, "#e8e8f0", "center");
+    const nameX = br.x + br.w + 10;
+    text(this.meta.name, nameX, br.y + 13, 14, "#e8e8f0", "left");
     const b = Save.best(this.meta.id);
-    text("最佳 " + b + " " + this.meta.unit, nameX, this.backRect.y + 29, 10, "#5a5a76", "left");
+    text("最佳 " + b + " " + this.meta.unit, nameX, br.y + 29, 10, "#5a5a76", "left");
     const sc = this.mod.hud ? this.mod.hud() : null;
-    if(sc) text(sc, W - 12, this.backRect.y + 17, 13, this.meta.color, "right");
+    if(sc) text(sc, W - 12, br.y + 17, 13, this.meta.color, "right");
 
     Fx.drawFlash(ctx);
     if(this.over) this.drawOver(dtGlobal);
@@ -758,8 +789,9 @@ Games.sort = {
         for(let c = 0; c < colors; c++) tubes.push(new Array(this.CAP).fill(c));
         for(let i = 0; i < emp; i++) tubes.push([]);
 
-        /* 随机洗牌颜色排列，再做反向合法移动以确保可解 */
-        const rng = Math.random;
+        /* 反向打乱：从"已完成"状态出发做合法操作，所以正着走一定能解回去。
+           关键：每次只搬 1 块。整管搬运（n=4）永远不会打破颜色分组，
+           290 次迭代后仍是已完成状态，玩家开局就无子可下 —— 这个坑踩过。 */
         const canPour = (from, to) => {
           if(from === to) return false;
           const f = tubes[from], t = tubes[to];
@@ -767,22 +799,38 @@ Games.sort = {
           if(t.length >= this.CAP) return false;
           const col = f[f.length - 1];
           if(t.length > 0 && t[t.length - 1] !== col) return false;
-          /* 不要产生"整管同色"的无意义回退 */
           return true;
         };
-        const scramble = 220 + lv * 70;
-        for(let k = 0; k < scramble; k++){
-          const cands = [];
-          for(let f = 0; f < total; f++) for(let t = 0; t < total; t++) if(canPour(f, t)) cands.push([f, t]);
-          if(!cands.length) break;
-          const [f, t] = cands[(rng() * cands.length) | 0];
-          const f_ = tubes[f], t_ = tubes[t];
-          /* 一次移动整段同色（更接近真实操作） */
-          const col = f_[f_.length - 1];
-          let n = 0;
-          while(n < f_.length && f_[f_.length - 1 - n] === col && t_.length + n < this.CAP) n++;
-          for(let i = 0; i < n; i++){ t_.push(f_.pop()); }
+        const scrambleOnce = () => {
+          const steps = 140 + lv * 40;
+          for(let k = 0; k < steps; k++){
+            const cands = [];
+            for(let f = 0; f < total; f++) for(let t = 0; t < total; t++) if(canPour(f, t)) cands.push([f, t]);
+            if(!cands.length) break;
+            const pickIdx = (Math.random() * cands.length) | 0;
+            const f = cands[pickIdx][0], t = cands[pickIdx][1];
+            tubes[t].push(tubes[f].pop());       /* 只搬 1 块 */
+          }
+        };
+        const isTubesSolved = () => tubes.every(
+          tb => tb.length === 0 || (tb.length === this.CAP && tb.every(x => x === tb[0]))
+        );
+        /* 重试几次；单块搬运下很少连续撞到已完成状态 */
+        for(let attempt = 0; attempt < 12 && isTubesSolved(); attempt++) scrambleOnce();
+
+        /* 兜底：万一仍然是已完成状态（小棋盘下概率不为零），
+           直接用"把整管搬到空管"的交换强制打破颜色分组。
+           这类交换同样是合法操作的反向，所以可解性不受影响。 */
+        if(isTubesSolved()){
+          const empties = [];
+          for(let i = 0; i < total; i++) if(tubes[i].length === 0) empties.push(i);
+          const src = 0;
+          const dst = empties.length ? empties[0] : (src === 0 ? 1 : 0);
+          if(tubes[dst] && tubes[dst].length < this.CAP && tubes[src].length > 0){
+            tubes[dst].push(tubes[src].pop());     /* 搬 1 块出来，颜色分组即被打破 */
+          }
         }
+
         this.tubes = tubes.map((b, i) => ({ blocks: b, x: 0, y: 0, i, shakeT: 0, liftT: 0 }));
         this.layout();
         this.sel = -1;
@@ -1700,10 +1748,13 @@ function frame(now){
   if(dt > 0.05) dt = 0.05;        // 卡顿保护，防止物理穿透
   dtGlobal = dt;
 
+  /* 必须在场景消费点击之前，把事件队列快照进来 */
+  Input.beginFrame();
+
   Fx.update(dt);
   if(App.scene){
-    if(App.scene.draw) App.scene.update(dt);
-    App.scene.draw(ctx);
+    if(App.scene.update) App.scene.update(dt);
+    if(App.scene.draw) App.scene.draw(ctx);
   }
   Input.endFrame();
   requestAnimationFrame(frame);

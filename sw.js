@@ -4,11 +4,12 @@
      · 静态资源  → stale-while-revalidate（先给缓存，后台静默更新）
    全部使用相对路径 + self.registration.scope，因此部署在子目录
    （例如 https://user.github.io/pixel-arcade/）也能正常工作。 */
-const VERSION = "pixel-arcade-v2";
+const VERSION = "pixel-arcade-v3";
 const CORE = [
   "./",
   "./index.html",
   "./manifest.webmanifest",
+  "./favicon.ico",
   "./icon-192.png",
   "./icon-512.png"
 ];

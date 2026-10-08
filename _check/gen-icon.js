@@ -143,6 +143,24 @@ for(const size of [192, 512]){
   fs.writeFileSync(path.join(outDir, "icon-" + size + ".png"), buf);
   console.log("已生成 icon-" + size + ".png  (" + buf.length + " bytes)");
 }
-/* 顺带生成一张 512 预览用于肉眼确认 */
-fs.writeFileSync(path.join(__dirname, "icon-preview.png"), encodePNG(512, 512, drawIcon(512)));
-console.log("预览已生成 _check/icon-preview.png");
+
+/* ---- favicon.ico：内嵌 32x32 PNG（Vista 以后的 ICO 支持这种写法） ---- */
+{
+  const png = encodePNG(32, 32, drawIcon(32));
+  const header = Buffer.alloc(6);
+  header.writeUInt16LE(0, 0);      // reserved
+  header.writeUInt16LE(1, 2);      // type: icon
+  header.writeUInt16LE(1, 4);      // count
+  const entry = Buffer.alloc(16);
+  entry[0] = 32;                   // width
+  entry[1] = 32;                   // height
+  entry[2] = 0;                    // palette
+  entry[3] = 0;                    // reserved
+  entry.writeUInt16LE(1, 4);       // color planes
+  entry.writeUInt16LE(32, 6);      // bits per pixel
+  entry.writeUInt32LE(png.length, 8);
+  entry.writeUInt32LE(6 + 16, 12); // offset
+  const ico = Buffer.concat([header, entry, png]);
+  fs.writeFileSync(path.join(outDir, "favicon.ico"), ico);
+  console.log("已生成 favicon.ico  (" + ico.length + " bytes)");
+}
