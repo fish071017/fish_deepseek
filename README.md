@@ -15,7 +15,14 @@ node _check\server.js
 或者把整个 `pixel-arcade` 文件夹丢到任意静态托管（GitHub Pages / Vercel / Netlify / 对象存储），
 手机访问 URL 后会提示「添加到主屏幕」——装完就是全屏 App，断网也能玩。
 
-**电脑上**：直接双击 `index.html` 即可。
+**完整部署步骤见 [`DEPLOY.md`](DEPLOY.md)**（含 GitHub Pages / Cloudflare Pages / 拖拽上传三种方案）。
+上线前先跑一次自检：
+
+```powershell
+node _check\preflight.js
+```
+
+**电脑上**：直接双击 `index.html` 即可（游戏能玩；离线缓存需 https 才生效）。
 
 ## 四款游戏
 
