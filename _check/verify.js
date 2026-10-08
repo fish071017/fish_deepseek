@@ -91,6 +91,9 @@ try {
 }
 const ev = (expr) => vm.runInContext(expr, ctxVm);
 
+let __pass = 0, __fail = 0;
+const ok  = (m) => { __pass++; console.log("    [OK]   " + m); };
+const bad = (m) => { __fail++; console.log("    [FAIL] " + m); };
 console.log("Node " + process.version + " 验证（使用 index.html 真实实现）");
 console.log("脚本加载: OK   W=" + ev("W") + " H=" + ev("H"));
 
@@ -231,6 +234,73 @@ console.log("脚本加载: OK   W=" + ev("W") + " H=" + ev("H"));
   console.log("  试管: 2 -> " + s[0] + (s[0] === 3 ? "  [OK]" : "  [FAIL]"));
 })();
 
+/* ================= 3b. 像素跳跃：可达性 + 移动平台不出屏 ================= */
+(function testJump(){
+  console.log("\n=== 像素跳跃：平台可达性 + 移动平台边界 ===");
+
+  /* ---- ① 可达性：用真实抛物线检查每一对平台 ---- */
+  const reach = ev(`(function(){
+    let worst = null, checked = 0, minSlack = 9999;
+    for(let trial = 0; trial < 40; trial++){
+      const m = Games.jump.create();
+      m.init({ win(){}, end(){}, go(){}, scene: null });
+      for(let i = 0; i < 60; i++) m.spawnNext();
+      for(let i = 0; i < m.plats.length - 1; i++){
+        const a = m.plats[i], b = m.plats[i+1];
+        const gap = a.y - b.y;
+        checked++;
+        /* 最坏情况：玩家站在 a 上离 b 最远的一端 */
+        const farX = (Math.abs(a.x - (b.x + b.w)) > Math.abs((a.x + a.w) - b.x)) ? a.x : (a.x + a.w);
+        const nearX = Math.max(b.x, Math.min(farX, b.x + b.w));
+        const need = Math.abs(nearX - farX);
+        const have = m.horizontalReach(gap);
+        minSlack = Math.min(minSlack, have - need);
+        if(have < need && (!worst || gap > worst.gap)){
+          worst = { idx: i + 1, gap: Math.round(gap), need: Math.round(need), have: Math.round(have) };
+        }
+      }
+    }
+    return { worst, checked, minSlack: Math.round(minSlack) };
+  })()`);
+  !reach.worst
+    ? ok("跳跃: 所有平台都够得着（检查 " + reach.checked + " 对，最小余量 " + reach.minSlack + "px）")
+    : bad("跳跃: 第 " + reach.worst.idx + " 个平台够不着 gap=" + reach.worst.gap +
+          " 需要横移 " + reach.worst.need + " 但只能 " + reach.worst.have);
+
+  /* ---- ② 移动平台：跑真实 update()，断言位移有界 ---- */
+  const mv = ev(`(function(){
+    const m = Games.jump.create();
+    m.init({ win(){}, end(){}, go(){}, scene: null });
+    for(let i = 0; i < 60; i++) m.spawnNext();
+    /* 把所有平台都变成移动平台，保证样本量 */
+    for(const pl of m.plats){ if(!pl.range){ pl.vx = 40; pl.range = 40; pl.mw = pl.x; } }
+    const moving = m.plats.filter(pl => pl.vx);
+    const startX = moving.map(pl => pl.x);
+    let offscreen = 0, minX = 1e9, maxX = -1e9;
+    /* 让玩家一直悬空，这样平台才会持续移动（游戏里只有空中时才动） */
+    m.player.onGround = false;
+    m.player.y = -100000;          // 远离岩浆，避免触发结束
+    for(let step = 0; step < 1800; step++){
+      m.player.onGround = false;
+      m.update(1/60, { win(){}, end(){}, go(){}, scene: null });
+      for(const pl of moving){
+        if(pl.x < -2 || pl.x + pl.w > W + 2) offscreen++;
+        if(pl.x < minX) minX = pl.x;
+        if(pl.x + pl.w > maxX) maxX = pl.x + pl.w;
+      }
+    }
+    let stuck = 0;
+    for(let i = 0; i < moving.length; i++) if(Math.abs(moving[i].x - startX[i]) < 3) stuck++;
+    return { n: moving.length, offscreen, stuck, minX: Math.round(minX), maxX: Math.round(maxX), W: W };
+  })()`);
+  (mv.offscreen === 0)
+    ? ok("跳跃: 移动平台始终在屏幕内（" + mv.n + " 个 × 30s，x 范围 " + mv.minX + "~" + mv.maxX + " / 屏宽 " + mv.W + "）")
+    : bad("跳跃: 移动平台出屏 " + mv.offscreen + " 帧，x 范围 " + mv.minX + "~" + mv.maxX + " / 屏宽 " + mv.W);
+  (mv.stuck === 0)
+    ? ok("跳跃: 移动平台确实在往返移动")
+    : bad("跳跃: 有 " + mv.stuck + " 个移动平台卡住不动");
+})();
+
 /* ================= 4. 场景与三游戏渲染冒烟 ================= */
 (function testScenes(){
   console.log("\n=== 场景与渲染冒烟 ===");
@@ -285,6 +355,7 @@ console.log("脚本加载: OK   W=" + ev("W") + " H=" + ev("H"));
   } catch(e){ console.log("  分享文案: 异常 -> " + e.message); }
 })();
 
+console.log("\n跳跃断言: 通过 " + __pass + " 项 · 失败 " + __fail + " 项");
 console.log("\n验证结束");
 
 

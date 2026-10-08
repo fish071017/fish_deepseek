@@ -62,7 +62,7 @@ let HALF = W / 2;
 const LS_KEY = "pixelArcade.v1";
 /* 构建版本：改动后请同步递增，并在 sw.js 里改 VERSION。
    用 ?debug=1 打开首页就能看到，用来确认手机拿到的不是旧缓存。 */
-const BUILD = "v5-三游戏版";
+const BUILD = "v6-跳跃手感";
 
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 const lerp  = (a, b, t) => a + (b - a) * t;
@@ -1431,32 +1431,58 @@ Games.jump = {
         const h = lerp(this.MIN_JUMP_H, this.MAX_JUMP_H, clamp(charge, 0, 1));
         return -Math.sqrt(2 * this.GRAV * h);
       },
+      /* 从高度差 rise 处起跳、横向以 SNAP_MAX_V 飞行，落地时最多能横向移动多少。
+         用真实抛物线算，而不是拍一个系数 —— 拍系数会导致"看着够得着其实够不着"。 */
+      horizontalReach(rise){
+        if(rise <= 0) return 220;
+        const v0 = Math.sqrt(2 * this.GRAV * this.MAX_JUMP_H);
+        const disc = v0 * v0 - 2 * this.GRAV * rise;
+        if(disc <= 0) return 0;                       // 根本升不到这个高度
+        const t = (v0 + Math.sqrt(disc)) / this.GRAV; // 上升到 rise 高度的时刻
+        /* 水平速度从 0 加速到上限需要时间，按 0.85 折算实际平均速度 */
+        return t * this.SNAP_MAX_V * 0.85;
+      },
       spawnNext(){
         const last = this.plats[this.plats.length - 1];
         const lv = this.plats.length;
         const w = clamp(this.baseW - lv * 1.4, 30, 96);
         const prevCx = last.x + last.w / 2;
-        /* 先按随机横向偏移定新中心，再据此确定纵向间距。
-           间距必须 <= 满蓄力高度 * 0.82，否则会出现跳不上去的死局。 */
-        const dxMax = clamp(96 - lv * 1.5, 46, 96);
+        /* 玩家的水平移动被限制在 SNAP_MAX_V（230px/s）以内，
+           所以横向位移必须留出加速的余量，否则会"看得见够不着"。 */
+        const maxHoriz = this.horizontalReach(0) * 0.95;
+        const dxMax = clamp(Math.min(96 - lv * 1.5, maxHoriz), 46, maxHoriz);
         const dx = rand(-dxMax, dxMax);
-        let cx = clamp(prevCx + dx, 20 + w / 2, W - 20 - w / 2);
+        const cx = clamp(prevCx + dx, 20 + w / 2, W - 20 - w / 2);
         const horiz = Math.abs(cx - prevCx);
-        /* 水平越远，纵向就得越近，保证这一跳够得着 */
-        const gapMax = clamp(this.MAX_GAP - horiz * 0.18, 62, this.MAX_GAP);
-        const gap = clamp(rand(0.72, 1.0) * gapMax, 58, gapMax);
+
+        /* 纵向间距按真实可达高度反推。
+           注意 horiz 用的是中心距，而玩家可能站在平台边缘，
+           所以再乘一个安全系数，保证最坏情况也跳得上去。 */
+        const safety = 0.88;
+        let gapMax = this.MAX_GAP;
+        for(let i = 0; i < 6; i++){
+          const reach = this.horizontalReach(gapMax) * safety;
+          if(reach >= horiz) break;
+          gapMax = Math.max(58, gapMax * 0.86);
+          if(gapMax <= 58) break;
+        }
+        gapMax = clamp(gapMax, 58, this.MAX_GAP);
+        const gap = clamp(rand(0.70, 1.0) * gapMax, 58, gapMax);
+
         const moving = lv > 5 && Math.random() < clamp(0.12 + lv * 0.03, 0, 0.55);
+        /* 移动平台的水平浮动范围必须让它始终待在屏幕内 */
+        const range = moving ? Math.min(rand(20, 52), cx - w / 2 - 16, W - 16 - (cx + w / 2)) : 0;
+        const canMove = moving && range > 8;
         this.plats.push({
           x: cx - w / 2, y: last.y - gap, w, h: 16, mw: cx - w / 2,
-          vx: moving ? (Math.random() < 0.5 ? -1 : 1) * rand(24, 24 + lv * 2.5) : 0,
-          range: moving ? rand(20, 52) : 0
+          vx: canMove ? (Math.random() < 0.5 ? -1 : 1) * rand(24, 24 + lv * 2.5) : 0,
+          range: canMove ? range : 0
         });
       },
       /* 找玩家上方、且够得着的最近平台（自动吸附的目标）。
          只在起跳瞬间调用一次，然后锁定 —— 如果每帧重算，
          玩家上升越过目标后目标会突然切换，横向速度反向，容易把人甩飞。 */
-      aimPlatform(){
-        const p = this.player;
+      aimPlatform(){        const p = this.player;
         const reach = (this.MAX_JUMP_H * 0.95) - 10;   // 稍留余量
         let best = null;
         for(const pl of this.plats){
@@ -1513,12 +1539,22 @@ Games.jump = {
         }
         if(this.sayCharge > 0) this.sayCharge -= dt;
 
-        /* 移动平台 */
+        /* 移动平台。
+           关键：碰到边界时不仅要翻转向量，还必须把位置夹回范围内。
+           只翻转不夹回的话，一旦越过边界 pl.x 会持续漂移出屏幕，
+           而越界判断永远为真、每帧翻转一次 —— 平台就永久留在屏幕外回不来了。 */
         for(const pl of this.plats){
-          if(pl.vx){
-            pl.mw += pl.vx * dt; pl.x += pl.vx * dt;
-            if(pl.range && (pl.x < pl.mw - pl.range || pl.x > pl.mw + pl.range)) pl.vx *= -1;
+          if(!pl.vx) continue;
+          pl.mw += pl.vx * dt;
+          pl.x += pl.vx * dt;
+          if(pl.range){
+            const lo = pl.mw - pl.range, hi = pl.mw + pl.range;
+            if(pl.x < lo){ pl.x = lo; pl.vx = Math.abs(pl.vx); }
+            else if(pl.x > hi){ pl.x = hi; pl.vx = -Math.abs(pl.vx); }
           }
+          /* 再夹一次屏幕范围，防止 range 计算变化导致跑出去 */
+          const sx = clamp(pl.x, 8, W - pl.w - 8);
+          if(sx !== pl.x){ pl.x = sx; pl.vx = -pl.vx; pl.mw = pl.x; }
         }
 
         if(!p.onGround){
