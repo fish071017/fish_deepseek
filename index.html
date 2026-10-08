@@ -1,0 +1,1778 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>像素街机 · PIXEL ARCADE</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b0b14">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="像素街机">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="apple-touch-icon" href="./icon-192.png">
+<style>
+  :root{
+    --bg:#0b0b14;
+    --ink:#e8e8f0;
+    --dim:#7a7a94;
+    --line:#25253a;
+    --safe-t:env(safe-area-inset-top,0px);
+    --safe-b:env(safe-area-inset-bottom,0px);
+    --safe-l:env(safe-area-inset-left,0px);
+    --safe-r:env(safe-area-inset-right,0px);
+  }
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{
+    width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--ink);
+    font-family:"Courier New",ui-monospace,monospace;
+    -webkit-user-select:none;user-select:none;
+    touch-action:none;overscroll-behavior:none;
+    -webkit-text-size-adjust:100%;
+  }
+  #stage{
+    position:fixed;left:0;top:0;
+    width:100vw;height:100vh;
+    height:100dvh;
+    display:block;touch-action:none;
+  }
+  /* 像素化缩放 */
+  canvas{image-rendering:pixelated;image-rendering:-moz-crisp-edges;}
+  .hidden{display:none !important;}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<script>
+"use strict";
+/* ==========================================================================
+   像素街机 PIXEL ARCADE — 单文件零依赖手机小游戏合集
+   四款游戏 · 像素复古 · 折磨优先难度 · 战绩分享 · 可离线 PWA
+   ========================================================================== */
+
+/* ============================ 常量与工具 ============================ */
+/* 逻辑视口：宽度固定 360，高度随设备比例调整（在 resize() 中改写）。
+   这样任何屏幕上 UI 的水平方向都完整可见，不会被裁切。 */
+const LW = 360;
+let W = LW, H = 640;
+let HALF = W / 2;
+const LS_KEY = "pixelArcade.v1";
+
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp  = (a, b, t) => a + (b - a) * t;
+const rand  = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const pick  = arr => arr[(Math.random() * arr.length) | 0];
+const easeOut = t => 1 - Math.pow(1 - t, 3);
+const easeIn  = t => t * t;
+
+/* ============================ 存档 ============================ */
+const Save = {
+  data: { best: {}, plays: {}, mute: false, totalRuns: 0 },
+  load(){
+    try{
+      const raw = localStorage.getItem(LS_KEY);
+      if(raw) Object.assign(this.data, JSON.parse(raw));
+      if(!this.data.best) this.data.best = {};
+      if(!this.data.plays) this.data.plays = {};
+    }catch(e){ /* 隐私模式等，静默降级 */ }
+  },
+  flush(){
+    try{ localStorage.setItem(LS_KEY, JSON.stringify(this.data)); }catch(e){}
+  },
+  best(id){ return this.data.best[id] || 0; },
+  /* 返回 true 表示破纪录 */
+  submit(id, score){
+    this.data.totalRuns++;
+    this.data.plays[id] = (this.data.plays[id] || 0) + 1;
+    const prev = this.data.best[id] || 0;
+    const isNew = score > prev;
+    if(isNew) this.data.best[id] = score;
+    this.flush();
+    return isNew;
+  }
+};
+
+/* ============================ 音效（WebAudio 合成，零素材） ============================ */
+const Sfx = {
+  ctx: null,
+  init(){
+    if(this.ctx) return;
+    try{
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if(AC) this.ctx = new AC();
+    }catch(e){ this.ctx = null; }
+  },
+  resume(){
+    if(!this.ctx) this.init();
+    if(this.ctx && this.ctx.state === "suspended") this.ctx.resume();
+  },
+  /* 基础方波/三角波音符 */
+  tone(freq, dur, type, vol, slideTo){
+    if(Save.data.mute) return;
+    if(!this.ctx) return;
+    const t0 = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = type || "square";
+    osc.frequency.setValueAtTime(freq, t0);
+    if(slideTo) osc.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol || 0.16, t0 + 0.006);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(g); g.connect(this.ctx.destination);
+    osc.start(t0); osc.stop(t0 + dur + 0.02);
+  },
+  /* 噪声（爆裂 / 落地） */
+  noise(dur, vol, hp){
+    if(Save.data.mute || !this.ctx) return;
+    const t0 = this.ctx.currentTime;
+    const len = Math.max(1, Math.floor(this.ctx.sampleRate * dur));
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for(let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = this.ctx.createBufferSource(); src.buffer = buf;
+    const g = this.ctx.createGain(); g.gain.value = vol || 0.12;
+    let node = src;
+    if(hp){
+      const f = this.ctx.createBiquadFilter();
+      f.type = "highpass"; f.frequency.value = hp;
+      node.connect(f); node = f;
+    }
+    node.connect(g); g.connect(this.ctx.destination);
+    src.start(t0);
+  },
+  tap(){ this.tone(520, 0.05, "square", 0.10); },
+  select(){ this.tone(760, 0.07, "square", 0.12); },
+  place(){ this.tone(320, 0.12, "triangle", 0.16, 520); },
+  good(){ this.tone(660, 0.08, "square", 0.13); setTimeout(()=>this.tone(990,0.10,"square",0.13), 60); },
+  perfect(){ [784, 988, 1319].forEach((f,i)=>setTimeout(()=>this.tone(f,0.10,"square",0.14), i*55)); },
+  fail(){ this.tone(220, 0.32, "sawtooth", 0.16, 60); this.noise(0.22, 0.10, 300); },
+  win(){ [523,659,784,1047].forEach((f,i)=>setTimeout(()=>this.tone(f,0.13,"square",0.14), i*90)); },
+  combo(n){ this.tone(500 + Math.min(n,10)*90, 0.09, "square", 0.14); },
+  whoosh(){ this.noise(0.12, 0.07, 900); }
+};
+
+/* ============================ 震屏 + 粒子 ============================ */
+const Fx = {
+  shake: 0, shakeDecay: 0.88,
+  particles: [],
+  flashes: [],
+  addShake(amt){ this.shake = Math.min(24, this.shake + amt); },
+  burst(x, y, n, color, spd){
+    for(let i = 0; i < n; i++){
+      const a = Math.random() * Math.PI * 2;
+      const s = rand(0.4, 1) * (spd || 180);
+      this.particles.push({
+        x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 40,
+        life: rand(0.3, 0.75), max: 0.75, color, size: randi(2, 5), g: 520
+      });
+    }
+  },
+  flash(color, dur){ this.flashes.push({ color, t: 0, dur: dur || 0.18 }); },
+  update(dt){
+    this.shake *= Math.pow(this.shakeDecay, dt * 60);
+    if(this.shake < 0.15) this.shake = 0;
+    for(let i = this.particles.length - 1; i >= 0; i--){
+      const p = this.particles[i];
+      p.life -= dt;
+      if(p.life <= 0){ this.particles.splice(i, 1); continue; }
+      p.vy += p.g * dt;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+    }
+    for(let i = this.flashes.length - 1; i >= 0; i--){
+      this.flashes[i].t += dt;
+      if(this.flashes[i].t >= this.flashes[i].dur) this.flashes.splice(i, 1);
+    }
+  },
+  drawParticles(ctx){
+    for(const p of this.particles){
+      ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(p.x | 0, p.y | 0, p.size, p.size);
+    }
+    ctx.globalAlpha = 1;
+  },
+  drawFlash(ctx){
+    for(const f of this.flashes){
+      ctx.globalAlpha = (1 - f.t / f.dur) * 0.5;
+      ctx.fillStyle = f.color;
+      ctx.fillRect(0, 0, W, H);
+    }
+    ctx.globalAlpha = 1;
+  },
+  clear(){ this.particles.length = 0; this.flashes.length = 0; this.shake = 0; }
+};
+
+/* 触感震动（安卓支持，iOS 静默忽略） */
+function buzz(ms){
+  if(Save.data.mute) return;
+  try{ if(navigator.vibrate) navigator.vibrate(ms); }catch(e){}
+}
+
+/* ============================ 画布与缩放 ============================ */
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d", { alpha: false });
+let scale = 1, offX = 0, offY = 0;
+
+function resize(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+
+  /* 以 canvas 自身的布局尺寸为准 —— 比 window.innerWidth 可靠，
+     某些浏览器/WebView 下两者会不一致，用错会导致画面溢出被裁。 */
+  let cssW = canvas.clientWidth, cssH = canvas.clientHeight;
+  if(!cssW || !cssH){
+    const r0 = canvas.getBoundingClientRect();
+    cssW = r0.width || window.innerWidth || 360;
+    cssH = r0.height || window.innerHeight || 640;
+  }
+  cssW = Math.round(cssW); cssH = Math.round(cssH);
+
+  const bufW = Math.max(1, Math.floor(cssW * dpr));
+  const bufH = Math.max(1, Math.floor(cssH * dpr));
+  if(canvas.width !== bufW) canvas.width = bufW;
+  if(canvas.height !== bufH) canvas.height = bufH;
+
+  /* 逻辑视口跟随设备比例：
+     W 固定 360（保证 UI 水平方向永远完整可见，绝不被裁），
+     H 按屏幕宽高比推算。手机普遍比 9:16 更窄长，所以 H 通常 > 640。 */
+  W = LW;
+  H = clamp(Math.round(LW * cssH / cssW), 560, 1000);
+  HALF = W / 2;
+
+  /* 按宽度铺满，高度居中 —— 全宽可见，绝不左右裁切 */
+  const realScale = canvas.width / W;
+  scale = realScale / dpr;
+  offX = 0;
+  offY = (canvas.height - H * realScale) / 2;
+  ctx.setTransform(realScale, 0, 0, realScale, offX, offY);
+  ctx.imageSmoothingEnabled = false;
+
+  /* 缓存 rect，避免每次触摸都触发布局计算（移动端性能关键） */
+  const r = canvas.getBoundingClientRect();
+  layoutRect = { left: r.left, top: r.top, dpr: canvas.width / r.width, unit: canvas.width / W };
+}
+let layoutRect = { left: 0, top: 0, dpr: 1, unit: 1 };
+window.addEventListener("resize", resize);
+window.addEventListener("orientationchange", () => setTimeout(resize, 120));
+
+/* 屏幕（CSS 像素）坐标 -> 逻辑坐标 */
+function screenToLogical(clientX, clientY){
+  const px = (clientX - layoutRect.left) * layoutRect.dpr;
+  const py = (clientY - layoutRect.top)  * layoutRect.dpr;
+  return { x: (px - offX) / layoutRect.unit, y: (py - offY) / layoutRect.unit };
+}
+
+/* ============================ 绘制原语（像素风） ============================ */
+function px(x, y, w, h, color){
+  ctx.fillStyle = color;
+  ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+}
+function text(str, x, y, size, color, align, shadow){
+  ctx.font = "bold " + size + "px 'Courier New',monospace";
+  ctx.textAlign = align || "left";
+  ctx.textBaseline = "middle";
+  if(shadow){ ctx.fillStyle = shadow; ctx.fillText(str, Math.round(x) + 2, Math.round(y) + 2); }
+  ctx.fillStyle = color;
+  ctx.fillText(str, Math.round(x), Math.round(y));
+}
+/* 把设计稿（参考高 640）的 y 坐标映射到当前屏幕高度，
+   让内容在任何比例的竖屏上都竖向铺得开，而不是挤在上半部分。
+   系数 0.86：H≈640 时接近原稿，H≈780 时上下留白均衡。 */
+function Y(y0){ return Math.round(y0 * H / 640 * 0.86); }
+function panel(x, y, w, h, fill, border, bw){
+  bw = bw || 3;
+  px(x, y, w, h, border || "#3a3a5c");
+  px(x + bw, y + bw, w - bw * 2, h - bw * 2, fill || "#16162a");
+}
+/* 圆角块（用小矩形拼出像素圆角感） */
+function block(x, y, w, h, color, light, dark){
+  px(x, y, w, h, color);
+  if(light){ px(x, y, w, 2, light); px(x, y, 2, h, light); }
+  if(dark){ px(x, y + h - 2, w, 2, dark); px(x + w - 2, y, 2, h, dark); }
+}
+
+/* ============================ 输入 ============================ */
+const Input = {
+  taps: [],            // 本帧点击 {x,y,t}
+  down: false,
+  downPos: { x: 0, y: 0 },
+  downTime: 0,
+  downDur: 0,          // 按住时长（秒）
+  released: false,
+  releaseDur: 0,
+  _start(ev){
+    Sfx.init(); Sfx.resume();
+    const t = ev.touches ? ev.touches[0] : ev;
+    const p = screenToLogical(t.clientX, t.clientY);
+    this.down = true; this.downPos = p; this.downTime = performance.now();
+    this.downDur = 0; this.pressed = true;
+  },
+  _move(ev){
+    if(!this.down) return;
+    const t = ev.touches ? ev.touches[0] : ev;
+    this.curPos = screenToLogical(t.clientX, t.clientY);
+  },
+  _end(ev){
+    if(!this.down) return;
+    this.down = false;
+    this.downDur = (performance.now() - this.downTime) / 1000;
+    this.taps.push({ x: this.downPos.x, y: this.downPos.y, dur: this.downDur });
+    this.released = true;
+    this.releaseDur = this.downDur;
+    this.releasePos = this.downPos;
+  },
+  endFrame(){ this.taps.length = 0; this.released = false; this.pressed = false; }
+};
+canvas.addEventListener("touchstart", e => { e.preventDefault(); Input._start(e); }, { passive: false });
+canvas.addEventListener("touchmove",  e => { e.preventDefault(); Input._move(e); },  { passive: false });
+canvas.addEventListener("touchend",   e => { e.preventDefault(); Input._end(e); },   { passive: false });
+canvas.addEventListener("touchcancel",e => { e.preventDefault(); Input._end(e); },   { passive: false });
+canvas.addEventListener("mousedown",  e => { e.preventDefault(); Input._start(e); });
+canvas.addEventListener("mousemove",  e => { Input._move(e); });
+window.addEventListener("mouseup",    e => { Input._end(e); });
+document.addEventListener("gesturestart", e => e.preventDefault());
+document.addEventListener("dblclick", e => e.preventDefault());
+document.addEventListener("contextmenu", e => e.preventDefault());
+
+/* ============================ 游戏注册表 ============================ */
+const GAMES = [
+  { id:"sort",  name:"像素试管", en:"PIXEL SORT",  icon:"tube",  desc:"把同色方块倒进同一个瓶子",  unit:"关", color:"#ff4d6d" },
+  { id:"arrow", name:"箭头开路", en:"ARROW RUSH",  icon:"arrow", desc:"点亮箭头，让它飞出屏幕",    unit:"关", color:"#4dd2ff" },
+  { id:"dash",  name:"一指点色", en:"TAP DASH",    icon:"dash",  desc:"方块涌来，点掉同色那一条",  unit:"分", color:"#ffd93d" },
+  { id:"jump",  name:"像素跳跃", en:"JUMP STACK",  icon:"jump",  desc:"蓄力一跳，别掉下去",        unit:"层", color:"#7cffb2" }
+];
+
+/* ============================ 场景管理 ============================ */
+const App = {
+  scene: null,
+  pending: null,
+  fade: 0,             // 0..1 过渡遮罩
+  fadeDir: 0,
+  t: 0,
+  go(name, payload){
+    if(this.scene && this.scene.exit) this.scene.exit();
+    this.scene = Scenes[name];
+    this.sceneName = name;
+    if(this.scene.enter) this.scene.enter(payload || {});
+    Fx.clear();
+  }
+};
+
+/* ======================================================================
+   场景：标题页
+   ====================================================================== */
+const Scenes = {};
+
+Scenes.title = {
+  enter(){
+    this.t = 0;
+    this.px = [];
+    for(let i = 0; i < 40; i++)
+      this.px.push({ x: rand(0, W), y: rand(0, H), s: randi(1, 3), v: rand(6, 26), c: pick(["#ff4d6d","#4dd2ff","#ffd93d","#7cffb2","#c77dff"]) });
+  },
+  update(dt){
+    this.t += dt;
+    for(const p of this.px){ p.y += p.v * dt; if(p.y > H + 4){ p.y = -4; p.x = rand(0, W); } }
+    for(const tp of Input.taps){
+      Sfx.select(); buzz(8);
+      App.go("home");
+    }
+  },
+  draw(){
+    ctx.fillStyle = "#0b0b14"; ctx.fillRect(0, 0, W, H);
+    for(const p of this.px) px(p.x, p.y, p.s, p.s, p.c);
+    const bob = Math.sin(this.t * 3) * 6;
+    /* 标题块上移、底部说明下移，两端锚定，中间自动留白 */
+    const ty = Math.round(H * 0.30);
+    text("像素", HALF, ty + bob, 60, "#e8e8f0", "center", "#ff4d6d");
+    text("街机", HALF, ty + 68 + bob, 60, "#e8e8f0", "center", "#4dd2ff");
+    text("P I X E L   A R C A D E", HALF, ty + 126 + bob, 13, "#7a7a94", "center");
+    /* 装饰线 */
+    px(HALF - 100, ty + 154, 200, 3, "#25253a");
+    /* 开始提示（闪烁） */
+    if(Math.sin(this.t * 5) > -0.3)
+      text("点 击 开 始", HALF, Math.round(H * 0.60), 20, "#ffd93d", "center", "#7a5c00");
+    text("4 款游戏 · 微信 / 浏览器直接玩 · 可离线", HALF, H - 74, 11, "#5a5a76", "center");
+    text("慎入：难度不友好", HALF, H - 50, 11, "#ff4d6d", "center");
+    Fx.drawParticles(ctx);
+  }
+};
+
+/* ======================================================================
+   场景：游戏选择
+   ====================================================================== */
+Scenes.home = {
+  enter(){ this.t = 0; this.tapCard = -1; this.tapT = 0; this.muteRect = null; },
+  cardRect(i){
+    /* 卡片高度固定（保证内部排版稳定），间距按剩余空间分配，
+       这样长屏上不会下方留一大片空白，短屏上也不会挤压。 */
+    const top = Math.round(H * 0.185), ch = 96;
+    const hintSpace = 68;
+    const avail = H - top - hintSpace - GAMES.length * ch;
+    const gap = clamp(Math.round(avail / (GAMES.length - 1)), 10, 46);
+    return { x: 24, y: top + i * (ch + gap), w: W - 48, h: ch };
+  },
+  hintY(){
+    const last = this.cardRect(GAMES.length - 1);
+    return last.y + last.h + 36;
+  },
+  update(dt){
+    this.t += dt;
+    if(this.tapT > 0){ this.tapT -= dt; if(this.tapT <= 0) App.go("game", { id: GAMES[this.tapCard].id }); return; }
+    for(const tp of Input.taps){
+      /* 静音开关 */
+      const mr = this.muteRect;
+      if(mr && tp.x >= mr.x && tp.x <= mr.x + mr.w && tp.y >= mr.y && tp.y <= mr.y + mr.h){
+        Save.data.mute = !Save.data.mute;
+        Save.flush();
+        if(!Save.data.mute){ Sfx.init(); Sfx.resume(); Sfx.good(); }
+        buzz(12); Fx.addShake(2);
+        continue;
+      }
+      for(let i = 0; i < GAMES.length; i++){
+        const r = this.cardRect(i);
+        if(tp.x >= r.x && tp.x <= r.x + r.w && tp.y >= r.y && tp.y <= r.y + r.h){
+          Sfx.select(); buzz(10); Fx.addShake(3);
+          this.tapCard = i; this.tapT = 0.14;
+          break;
+        }
+      }
+    }
+  },
+  draw(){
+    ctx.fillStyle = "#0b0b14"; ctx.fillRect(0, 0, W, H);
+    /* 顶栏 */
+    text("像素街机", 24, 62, 26, "#e8e8f0", "left", "#ff4d6d");
+    text("PIXEL ARCADE", 24, 88, 11, "#5a5a76", "left");
+    /* 静音按钮 */
+    this.muteRect = { x: W - 60, y: 48, w: 36, h: 36 };
+    panel(this.muteRect.x, this.muteRect.y, 36, 36, Save.data.mute ? "#2a1a1a" : "#1a2a22", "#3a3a5c", 2);
+    text(Save.data.mute ? "🔇" : "🔊", this.muteRect.x + 18, this.muteRect.y + 19, 16, "#e8e8f0", "center");
+    text("总游玩 " + (Save.data.totalRuns || 0) + " 次", 24, Math.round(H * 0.148), 11, "#5a5a76", "left");
+
+    GAMES.forEach((g, i) => {
+      const r = this.cardRect(i);
+      const pressed = this.tapCard === i;
+      const dx = pressed ? 4 : 0, dy = pressed ? 4 : 0;
+      panel(r.x + dx, r.y + dy, r.w, r.h, pressed ? "#20203a" : "#16162a", g.color, 3);
+      /* 图标 */
+      drawGameIcon(g.icon, r.x + 22 + dx, r.y + 22 + dy, 52, g.color);
+      /* 文字 */
+      text(g.name, r.x + 92 + dx, r.y + 34 + dy, 21, "#e8e8f0", "left");
+      text(g.en,   r.x + 92 + dx, r.y + 56 + dy, 10, "#5a5a76", "left");
+      text(g.desc, r.x + 92 + dx, r.y + 76 + dy, 11, "#9a9ab4", "left");
+      /* 最高分 */
+      const b = Save.best(g.id);
+      if(b > 0){
+        text(b + g.unit, r.x + r.w - 16 + dx, r.y + 30 + dy, 17, g.color, "right", "#000");
+        text("最佳", r.x + r.w - 16 + dx, r.y + 52 + dy, 10, "#5a5a76", "right");
+      }
+    });
+    text("难度：不友好 · 连败也不一定会放过你", HALF, this.hintY(), 11, "#5a5a76", "center");
+    /* 诊断读数：部署到线上后用 ?debug=1 打开，确认离线/缩放是否正常 */
+    if(location.search.indexOf("debug") >= 0){
+      const dy = this.hintY() + 22;
+      const ctl = ("serviceWorker" in navigator) && navigator.serviceWorker.controller ? "有" : "无";
+      text("PWA: " + PWA.status + " | controller:" + ctl + " | " + PWA.detail, 8, dy, 9, "#7cffb2", "left");
+      text("viewport " + W + "x" + H + " | css " + canvas.clientWidth + "x" + canvas.clientHeight +
+           " | dpr " + (window.devicePixelRatio || 1) + " | " + location.protocol, 8, dy + 13, 9, "#4dd2ff", "left");
+      text("scope path: " + (location.pathname || "/"), 8, dy + 26, 9, "#ffd93d", "left");
+    }
+    Fx.drawParticles(ctx);
+  }
+};
+
+function drawGameIcon(kind, x, y, box, color){
+  const u = box / 8;
+  if(kind === "tube"){
+    /* 试管 */
+    px(x + u, y + u, u * 2, u * 6, "#3a3a5c");
+    px(x + u * 1.3, y + u * 1.3, u * 1.4, u * 3.4, color);
+    px(x + u * 4.4, y + u * 2, u * 2, u * 5, "#3a3a5c");
+    px(x + u * 4.7, y + u * 3.4, u * 1.4, u * 3.2, "#4dd2ff");
+  } else if(kind === "arrow"){
+    px(x, y + u * 3, u * 6, u * 2, color);
+    px(x + u * 4, y + u, u * 2, u * 2, color);
+    px(x + u * 4, y + u * 5, u * 2, u * 2, color);
+    px(x + u * 6, y + u * 2.5, u * 2, u * 3, color);
+  } else if(kind === "dash"){
+    px(x + u * 1.5, y, u * 1.4, u * 3, color);
+    px(x + u * 4, y + u * 2.5, u * 1.4, u * 3, "#4dd2ff");
+    px(x + u * 6.5, y + u * 1, u * 1.4, u * 3, "#ff4d6d");
+    px(x, y + u * 6, u * 8, u * 1.4, "#3a3a5c");
+  } else {
+    px(x + u, y + u * 5, u * 3, u * 2, color);
+    px(x + u * 5, y + u * 4, u * 3, u * 2, "#4dd2ff");
+    px(x + u * 3.5, y, u * 1.4, u * 2, "#ffd93d");
+  }
+}
+
+/* ======================================================================
+   场景：游戏容器（统一顶栏 / 结束面板）
+   ====================================================================== */
+Scenes.game = {
+  enter(p){
+    const g = GAMES.find(x => x.id === p.id) || GAMES[0];
+    this.meta = g;
+    this.mod = (Games[g.id] && Games[g.id].create) ? Games[g.id].create() : {};
+    this.over = false;
+    this.overT = 0;
+    this.score = 0;
+    this.isNew = false;
+    this.t = 0;
+    this.advancing = false;
+    this.startLevel = p.level || 1;
+    this.mod.level = this.startLevel;
+    if(this.mod.init) this.mod.init(this);
+  },
+  exit(){ if(this.mod && this.mod.dispose) this.mod.dispose(); },
+  /* 由游戏逻辑调用结束失败 */
+  end(score){
+    if(this.over) return;
+    this.over = true; this.overT = 0;
+    this.score = Math.max(0, Math.round(score || 0));
+    this.isNew = Save.submit(this.meta.id, this.score);
+    this.showShare = false;
+    Sfx.fail(); Fx.addShake(16); buzz([30, 40, 60]);
+  },
+  /* 由游戏逻辑调用过关。若能进入下一关则自动续关，否则结算。 */
+  win(score, msg){
+    if(this.over) return;
+    this.winFlag = true;
+    const next = this.mod.advance ? this.mod.advance() : null;
+    if(next){
+      /* Hades 式续关：不停顿，直接下一关 */
+      this.advancing = true;
+      this.advT = 0.55;
+      this.nextLevel = next;
+      this.advMsg = msg || "";
+      this.lastScore = Math.max(0, Math.round(score || 0));
+      return;
+    }
+    this.over = true; this.overT = 0; this.win = true; this.winMsg = msg || "";
+    this.score = Math.max(0, Math.round(score || 0));
+    this.isNew = Save.submit(this.meta.id, this.score);
+    this.showShare = false;
+    Sfx.win(); Fx.flash("#ffffff", 0.25); Fx.addShake(10);
+  },
+  update(dt){
+    this.t += dt;
+    /* 过关续关过渡 */
+    if(this.advancing){
+      this.advT -= dt;
+      if(this.advT <= 0){
+        const lv = this.nextLevel;
+        this.advancing = false;
+        App.go("game", { id: this.meta.id, level: lv });
+        return;
+      }
+    }
+    if(!this.over && !this.advancing){
+      if(this.mod.update) this.mod.update(dt, this);
+    } else if(this.over){
+      this.overT += dt;
+      if(Input.released){
+        /* 先判断按钮 */
+        const bp = this.btnPos || {};
+        const hit = (r) => r && Input.releasePos.x >= r.x && Input.releasePos.x <= r.x + r.w &&
+                                 Input.releasePos.y >= r.y && Input.releasePos.y <= r.y + r.h;
+        if(hit(bp.retry)){ Sfx.select(); buzz(10); App.go("game", { id: this.meta.id }); return; }
+        if(hit(bp.home)){ Sfx.select(); buzz(10); App.go("home"); return; }
+        if(hit(bp.share)){ this.doShare(); return; }
+      }
+    }
+    /* 顶栏返回按钮（任何时刻，续关过渡中除外） */
+    if(this.advancing) return;
+    this.backRect = { x: 12, y: 10, w: 44, h: 34 };
+    for(const tp of Input.taps){
+      if(tp.x >= this.backRect.x && tp.x <= this.backRect.x + this.backRect.w &&
+         tp.y >= this.backRect.y && tp.y <= this.backRect.y + this.backRect.h){
+        Sfx.select(); buzz(8); App.go("home"); return;
+      }
+    }
+  },
+  doShare(){
+    const g = this.meta;
+    const lines = [];
+    lines.push("【像素街机 · " + g.name + "】");
+    lines.push("我打到 " + this.score + " " + g.unit + (this.isNew ? "   ★新纪录" : ""));
+    lines.push("历史最佳 " + Save.best(g.id) + " " + g.unit);
+    lines.push("");
+    lines.push("难度不友好，来试试你能不能超过我 →");
+    const txt = lines.join("\n");
+    let ok = false;
+    try{
+      if(navigator.share){ navigator.share({ title: "像素街机", text: txt }).catch(()=>{}); ok = true; }
+    }catch(e){}
+    if(!ok){
+      try{
+        const ta = document.createElement("textarea");
+        ta.value = txt; ta.style.position = "fixed"; ta.style.opacity = "0";
+        document.body.appendChild(ta); ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        this.copied = 1.6;
+        Sfx.good(); buzz(20);
+      }catch(e){
+        /* 兜底：提示手动复制 */
+        this.manualShare = txt;
+      }
+    }
+  },
+  draw(){
+    ctx.fillStyle = "#0b0b14"; ctx.fillRect(0, 0, W, H);
+    ctx.save();
+    if(Fx.shake > 0){
+      ctx.translate(rand(-Fx.shake, Fx.shake) | 0, rand(-Fx.shake, Fx.shake) | 0);
+    }
+    if(this.mod.draw) this.mod.draw(ctx);
+    Fx.drawParticles(ctx);
+    ctx.restore();
+
+    /* 顶栏：返回键在左，游戏名+最佳紧邻其右，状态读数靠右。
+       三者水平分区，互不重叠（此前居中的标题会被右侧读数压住）。 */
+    panel(this.backRect.x, this.backRect.y, this.backRect.w, this.backRect.h, "#16162a", "#3a3a5c", 2);
+    text("‹", this.backRect.x + 21, this.backRect.y + 17, 22, "#e8e8f0", "center");
+    const nameX = this.backRect.x + this.backRect.w + 10;
+    text(this.meta.name, nameX, this.backRect.y + 13, 14, "#e8e8f0", "left");
+    const b = Save.best(this.meta.id);
+    text("最佳 " + b + " " + this.meta.unit, nameX, this.backRect.y + 29, 10, "#5a5a76", "left");
+    const sc = this.mod.hud ? this.mod.hud() : null;
+    if(sc) text(sc, W - 12, this.backRect.y + 17, 13, this.meta.color, "right");
+
+    Fx.drawFlash(ctx);
+    if(this.over) this.drawOver(dtGlobal);
+    if(this.advancing) this.drawAdvance();
+  },
+  drawAdvance(){
+    const t = clamp(1 - this.advT / 0.55, 0, 1);
+    ctx.globalAlpha = Math.sin(t * Math.PI) * 0.72;
+    ctx.fillStyle = "#7cffb2";
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+    const pop = easeOut(clamp(t * 2.2, 0, 1));
+    text("过 关 !", HALF, H / 2 - 40, 30 + pop * 16, "#0b0b14", "center");
+    text(this.advMsg || "", HALF, H / 2 + 10, 14, "#0b0b14", "center");
+    text("进入第 " + this.nextLevel + " 关…", HALF, H / 2 + 42, 13, "#204030", "center");
+    text("累计 " + this.lastScore + " " + this.meta.unit, HALF, H / 2 + 70, 11, "#204030", "center");
+  },
+  drawOver(dt){
+    const t = clamp(this.overT / 0.28, 0, 1);
+    ctx.globalAlpha = t * 0.82;
+    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+    const slide = (1 - easeOut(t)) * 40;
+    const py = Y(150) + slide;
+    const ph = 340;
+    panel(28, py, W - 56, ph, "#16162a", this.win ? "#7cffb2" : this.meta.color, 4);
+    text(this.win ? "通 关 !" : "结 束", HALF, py + 48, 34, this.win ? "#7cffb2" : this.meta.color, "center", "#000");
+    text(this.win ? (this.winMsg || "") : "差一点。真的只差一点。", HALF, py + 82, 12, "#7a7a94", "center");
+
+    text("本局成绩", HALF, py + 122, 12, "#7a7a94", "center");
+    text(this.score + " " + this.meta.unit, HALF, py + 152, 44, "#e8e8f0", "center", this.meta.color);
+    const b = Save.best(this.meta.id);
+    text("历史最佳 " + b + " " + this.meta.unit, HALF, py + 186, 12, "#9a9ab4", "center");
+    if(this.isNew && Math.sin(this.t * 6) > -0.4)
+      text("★ 新 纪 录 ★", HALF, py + 210, 15, "#ffd93d", "center", "#7a5c00");
+
+    /* 按钮 */
+    const bw = (W - 56 - 40 - 12) / 2;
+    const by = py + 236;
+    const r1 = { x: 40, y: by, w: bw, h: 48 };
+    const r2 = { x: 40 + bw + 12, y: by, w: bw, h: 48 };
+    panel(r1.x, r1.y, r1.w, r1.h, "#20203a", this.meta.color, 3);
+    text("再来一局", r1.x + r1.w / 2, r1.y + 25, 15, "#e8e8f0", "center");
+    panel(r2.x, r2.y, r2.w, r2.h, "#20203a", "#3a3a5c", 3);
+    text("返回", r2.x + r2.w / 2, r2.y + 25, 15, "#9a9ab4", "center");
+
+    /* 分享 */
+    const sr = { x: 40, y: by + 60, w: W - 80, h: 38 };
+    panel(sr.x, sr.y, sr.w, sr.h, "#1a2a22", "#7cffb2", 2);
+    text(this.copied > 0 ? "✓ 已复制，去发群里" : "复制战绩文案", sr.x + sr.w / 2, sr.y + 20, 14, "#7cffb2", "center");
+    if(this.copied > 0) this.copied -= dt;
+
+    if(this.manualShare){
+      text("请长按选中复制：", HALF, sr.y + 52, 10, "#7a7a94", "center");
+    }
+    this.btnPos = { retry: r1, home: r2, share: sr };
+  }
+};
+
+/* ======================================================================
+   游戏 F：像素试管分类 PIXEL SORT
+   规则：点选一个试管取顶部同色块 → 点另一个试管倒入。
+        同色才能叠，试管满 4 格不能再倒。全部整管同色即过关。
+   难度：折磨优先。第 2 关起颜色数陡增，空管只有 1 根。
+   ====================================================================== */
+const PALETTE = ["#ff4d6d", "#4dd2ff", "#ffd93d", "#7cffb2", "#c77dff", "#ff9f45", "#3dffd0", "#ff6ec7", "#8a7dff", "#a8ff3d"];
+
+/* 统一顶栏高度与内容区范围：所有游戏都在 [TOP_UI, 底部提示) 之间排布，
+   避免出现"UI 叠在标题上"或"内容全挤在上半屏"。 */
+const TOP_UI = 54;
+function boardTop(){ return TOP_UI + 40; }      /* 顶栏(44) + 状态条带(~32) */
+function boardBottom(){ return H - 62; }
+function boardMid(){ return (boardTop() + boardBottom()) / 2; }
+function boardAvail(){ return Math.max(120, boardBottom() - boardTop()); }
+
+const Games = {};
+
+Games.sort = {
+  create(){
+    return {
+      CAP: 4,
+      states: [],          // 撤销栈
+      tubes: [],           // {blocks:[color...], x,y, hover, shake}
+      sel: -1,
+      level: 1,
+      pouring: null,       // 倒水动画
+      clearT: 0,
+      msg: "", msgT: 0,
+      fails: 0,
+      init(app){
+        this.level = this.level || 1;
+        this.t = 0;
+        this.buildLevel();
+        this.app = app;
+      },
+      /* 过关：直接在原对象上生成下一关，无缝续关 */
+      advance(){
+        this.level++;
+        this.buildLevel();
+        return this.level;
+      },
+      /* ---- 关卡生成：反向打乱，保证有解 ---- */
+      buildLevel(){
+        const lv = this.level;
+        /* 折磨曲线：第 1 关 3 色，第 2 关直接 5 色 —— 难度悬崖 */
+        let colors;
+        if(lv === 1) colors = 3;
+        else if(lv === 2) colors = 5;
+        else colors = clamp(4 + Math.floor(lv * 0.9), 5, PALETTE.length);
+        const emp = lv <= 2 ? 1 : (lv % 4 === 0 ? 2 : 1);   // 几乎永远只有 1 根空管
+        const total = colors + emp;
+
+        /* 初始：按颜色堆满，前 emp 根为空 */
+        let tubes = [];
+        for(let c = 0; c < colors; c++) tubes.push(new Array(this.CAP).fill(c));
+        for(let i = 0; i < emp; i++) tubes.push([]);
+
+        /* 随机洗牌颜色排列，再做反向合法移动以确保可解 */
+        const rng = Math.random;
+        const canPour = (from, to) => {
+          if(from === to) return false;
+          const f = tubes[from], t = tubes[to];
+          if(f.length === 0) return false;
+          if(t.length >= this.CAP) return false;
+          const col = f[f.length - 1];
+          if(t.length > 0 && t[t.length - 1] !== col) return false;
+          /* 不要产生"整管同色"的无意义回退 */
+          return true;
+        };
+        const scramble = 220 + lv * 70;
+        for(let k = 0; k < scramble; k++){
+          const cands = [];
+          for(let f = 0; f < total; f++) for(let t = 0; t < total; t++) if(canPour(f, t)) cands.push([f, t]);
+          if(!cands.length) break;
+          const [f, t] = cands[(rng() * cands.length) | 0];
+          const f_ = tubes[f], t_ = tubes[t];
+          /* 一次移动整段同色（更接近真实操作） */
+          const col = f_[f_.length - 1];
+          let n = 0;
+          while(n < f_.length && f_[f_.length - 1 - n] === col && t_.length + n < this.CAP) n++;
+          for(let i = 0; i < n; i++){ t_.push(f_.pop()); }
+        }
+        this.tubes = tubes.map((b, i) => ({ blocks: b, x: 0, y: 0, i, shakeT: 0, liftT: 0 }));
+        this.layout();
+        this.sel = -1;
+        this.states = [];
+        this.pouring = null;
+        this.moves = this.movesForColors(colors);
+      },
+      movesForColors(colors){
+        /* 步数上限：折磨但可达 */
+        return colors * 4 + (this.level >= 2 ? 6 : 4);
+      },
+      layout(){
+        const n = this.tubes.length;
+        const perRow = n <= 5 ? n : Math.ceil(n / 2);
+        const rows = Math.ceil(n / perRow);
+        let tw = 30, th = 112;
+        const gapX = n <= 5 ? 14 : 10, gapY = 46;
+        /* 按可用高度自动缩放，保证多行时也完整放得下 */
+        const totalH = rows * th + (rows - 1) * gapY;
+        const avail = boardAvail() - 18;
+        if(totalH > avail){
+          const k = clamp(avail / totalH, 0.62, 1);
+          tw *= k; th *= k;
+        }
+        const startY = Math.round(boardMid() - (rows * th + (rows - 1) * gapY) / 2);
+        this.tubes.forEach((tb, i) => {
+          const r = i < perRow ? 0 : 1;
+          const c = i < perRow ? i : i - perRow;
+          const cnt = r === 0 ? perRow : n - perRow;
+          const rw = cnt * tw + (cnt - 1) * gapX;
+          const sx = (W - rw) / 2;
+          tb.x = sx + c * (tw + gapX);
+          tb.y = startY + r * (th + gapY);
+          tb.w = tw; tb.h = th;
+        });
+      },
+      /* ---- 查询辅助 ---- */
+      topColor(tb){ return tb.blocks.length ? tb.blocks[tb.blocks.length - 1] : -1; },
+      topRun(tb){
+        if(!tb.blocks.length) return 0;
+        const c = this.topColor(tb); let n = 0;
+        for(let i = tb.blocks.length - 1; i >= 0 && tb.blocks[i] === c; i--) n++;
+        return n;
+      },
+      isDone(tb){
+        return tb.blocks.length === this.CAP && tb.blocks.every(b => b === tb.blocks[0]);
+      },
+      isSolved(){ return this.tubes.every(tb => tb.blocks.length === 0 || this.isDone(tb)); },
+      snapshot(){
+        this.states.push(this.tubes.map(tb => tb.blocks.slice()));
+        /* 只保留 1 步撤销：折磨优先 */
+        while(this.states.length > 1) this.states.shift();
+      },
+      undo(){
+        if(!this.states.length){ this.say("没有可撤销的步数了"); return; }
+        const s = this.states.pop();
+        this.tubes.forEach((tb, i) => { tb.blocks = s[i].slice(); tb.shakeT = 0.12; });
+        this.sel = -1; Sfx.place(); Fx.addShake(3);
+      },
+      say(m){ this.msg = m; this.msgT = 1.6; },
+
+      update(dt, app){
+        this.app = app;
+        this.t += dt;
+        if(this.msgT > 0) this.msgT -= dt;
+        this.tubes.forEach(tb => { if(tb.shakeT > 0) tb.shakeT -= dt; if(tb.liftT > 0) tb.liftT -= dt; });
+
+        /* 通关动画 */
+        if(this.clearT > 0){
+          this.clearT -= dt;
+          if(this.clearT <= 0){ app.win(this.level, "第 " + this.level + " 关已破"); }
+          return;
+        }
+        /* 倒水动画中 */
+        if(this.pouring){
+          const p = this.pouring;
+          p.t += dt * 4.2;
+          if(p.t >= 1){
+            const from = this.tubes[p.from], to = this.tubes[p.to];
+            for(let i = 0; i < p.n; i++) to.blocks.push(from.blocks.pop());
+            this.pouring = null;
+            Sfx.place(); buzz(12); Fx.addShake(2);
+            const c = this.topColor(to);
+            Fx.burst(to.x + to.w / 2, to.y + 20, 8, PALETTE[c >= 0 ? c : 0], 120);
+            if(this.isDone(to)){
+              Sfx.perfect(); Fx.addShake(6);
+              Fx.burst(to.x + to.w / 2, to.y + to.h / 2, 16, PALETTE[to.blocks[0]], 200);
+            }
+            /* 通关优先于步数判定 */
+            if(this.isSolved()){
+              this.clearT = 0.5;
+              Sfx.win(); Fx.flash("#ffffff", 0.3);
+              for(const tb of this.tubes) Fx.burst(tb.x + tb.w / 2, tb.y + tb.h / 2, 10, PALETTE[tb.blocks[0]], 220);
+              return;
+            }
+            /* 步数限制：折磨优先，步数用尽直接结束 */
+            this.moves--;
+            if(this.moves <= 0){
+              this.say("步数耗尽");
+              app.end(this.level - 1);
+              return;
+            }
+          }
+          return;
+        }
+        for(const tp of Input.taps){
+          /* 撤销按钮 */
+          const ur = this.undoRect;
+          if(ur && tp.x >= ur.x && tp.x <= ur.x + ur.w && tp.y >= ur.y && tp.y <= ur.y + ur.h){
+            this.undo(); continue;
+          }
+          /* 命中试管 */
+          let hit = -1;
+          for(let i = 0; i < this.tubes.length; i++){
+            const r = this.tubeRect(this.tubes[i]);
+            if(tp.x >= r.x - 6 && tp.x <= r.x + r.w + 6 && tp.y >= r.y - 8 && tp.y <= r.y + r.h + 6){ hit = i; break; }
+          }
+          if(hit < 0){ if(this.sel >= 0){ this.sel = -1; Sfx.tap(); } continue; }
+          const tb = this.tubes[hit];
+          if(this.sel < 0){
+            if(tb.blocks.length === 0){ this.say("这根是空的"); continue; }
+            if(this.isDone(tb)){ this.say("这管已经完成了"); continue; }
+            this.sel = hit; Sfx.select(); buzz(8); tb.liftT = 0.14;
+          } else if(this.sel === hit){
+            this.sel = -1; Sfx.tap();
+          } else {
+            const from = this.tubes[this.sel], to = tb;
+            /* 合法性 */
+            if(this.isDone(from)){ this.sel = -1; this.say("完成的不动了"); continue; }
+            if(to.blocks.length >= this.CAP){
+              tb.shakeT = 0.3; Sfx.fail(); Fx.addShake(4); this.say("满了"); this.sel = -1; continue;
+            }
+            const cf = this.topColor(from), ct = this.topColor(to);
+            if(to.blocks.length > 0 && cf !== ct){
+              tb.shakeT = 0.3; from.shakeT = 0.3; Sfx.fail(); Fx.addShake(4);
+              this.say("颜色不一样，倒不进去"); this.sel = -1; continue;
+            }
+            const n = Math.min(this.topRun(from), this.CAP - to.blocks.length);
+            this.snapshot();
+            this.pouring = { from: this.sel, to: hit, n, t: 0, color: cf };
+            /* 预扣除：动画结束时统一推入 */
+            for(let i = 0; i < n; i++) from.blocks.pop();
+            this.sel = -1;
+          }
+        }
+      },
+      tubeRect(tb){
+        const lift = tb.liftT > 0 ? -8 : 0;
+        const sx = tb.shakeT > 0 ? rand(-3, 3) : 0;
+        return { x: tb.x + sx, y: tb.y + lift, w: tb.w, h: tb.h };
+      },
+      hud(){ return "第 " + this.level + " 关 · 步 " + Math.max(0, this.moves); },
+      draw(){
+        const lv = this.level;
+        /* 状态条紧贴顶栏下方，不再与关卡文字叠在一起 */
+        const barY = boardTop();
+        const bw = W - 100, bx = 50;
+        const ratio = clamp(this.moves / (this.tubes.length * 4 + 8), 0, 1);
+        px(bx, barY, bw, 5, "#25253a");
+        px(bx, barY, bw * ratio, 5, ratio < 0.25 ? "#ff4d6d" : "#7cffb2");
+        text("第 " + lv + " 关", 10, barY + 4, 11, "#7a7a94", "left");
+        const lowMoves = this.moves <= 3;
+        text("步数 " + Math.max(0, this.moves), W - 10, barY + 4, 11,
+             lowMoves && Math.sin(this.t * 8) > 0 ? "#ff4d6d" : "#5a5a76", "right");
+
+        /* 试管 */
+        this.tubes.forEach((tb, i) => {
+          const r = this.tubeRect(tb);
+          const selected = this.sel === i;
+          /* 管身 */
+          px(r.x, r.y, r.w, r.h, "#3a3a5c");
+          px(r.x + 3, r.y + 3, r.w - 6, r.h - 6, "#101020");
+          /* 管口 */
+          px(r.x - 2, r.y - 3, r.w + 4, 5, selected ? "#ffd93d" : "#4a4a70");
+          /* 方块 */
+          const cap = this.CAP;
+          const bh = (r.h - 10) / cap;
+          const active = this.pouring && this.pouring.from === i;
+          const blocks = active ? tb.blocks : tb.blocks;
+          blocks.forEach((c, k) => {
+            const by = r.y + r.h - 6 - (k + 1) * bh;
+            const col = PALETTE[c % PALETTE.length];
+            block(r.x + 4, by + 1, r.w - 8, bh - 2, col, "rgba(255,255,255,.35)", "rgba(0,0,0,.35)");
+          });
+          /* 选中高亮 */
+          if(selected){
+            const pulse = 0.5 + 0.5 * Math.sin(this.t * 10);
+            ctx.globalAlpha = 0.35 + pulse * 0.45;
+            px(r.x - 3, r.y - 6, r.w + 6, 3, "#ffd93d");
+            ctx.globalAlpha = 1;
+            /* 箭头指示 */
+            text("▲", r.x + r.w / 2, r.y - 14, 12, "#ffd93d", "center");
+          }
+        });
+
+        /* 撤销按钮 */
+        this.undoRect = { x: W / 2 - 46, y: H - 92, w: 92, h: 38 };
+        const canUndo = this.states.length > 0;
+        panel(this.undoRect.x, this.undoRect.y, this.undoRect.w, this.undoRect.h,
+              canUndo ? "#20203a" : "#161620", canUndo ? "#9a9ab4" : "#2a2a3a", 2);
+        text("↶ 撤销 (" + this.states.length + ")", this.undoRect.x + this.undoRect.w / 2, this.undoRect.y + 20, 13,
+             canUndo ? "#e8e8f0" : "#4a4a60", "center");
+        text("每关只能撤销 1 步", HALF, H - 42, 10, "#5a5a76", "center");
+
+        /* 提示语 */
+        if(this.msgT > 0 && this.msg){
+          ctx.globalAlpha = clamp(this.msgT / 0.5, 0, 1);
+          panel(30, H - 150, W - 60, 34, "#2a1a2a", "#ff4d6d", 2);
+          text(this.msg, HALF, H - 133, 12, "#ffb3c1", "center");
+          ctx.globalAlpha = 1;
+        }
+
+        /* 倒水动画 */
+        if(this.pouring){
+          const p = this.pouring;
+          const from = this.tubes[p.from], to = this.tubes[p.to];
+          const col = PALETTE[p.color % PALETTE.length];
+          const e = easeIn(p.t);
+          const fx = from.x + from.w / 2, fy = from.y - 16;
+          const tx = to.x + to.w / 2, ty = to.y - 16;
+          const cx = lerp(fx, tx, e), cy = Math.min(fy, ty) - Math.sin(e * Math.PI) * 60;
+          /* 飞行块 */
+          for(let i = 0; i < p.n; i++){
+            const off = i * 9;
+            block(cx - 6 + off * 0.3, cy - i * 4, 13, 13, col, "rgba(255,255,255,.4)", "rgba(0,0,0,.3)");
+          }
+          /* 尾迹 */
+          ctx.globalAlpha = 0.4;
+          for(let i = 0; i < 6; i++){
+            const te = clamp(e - i * 0.05, 0, 1);
+            px(lerp(fx, tx, te) - 2, lerp(fy, ty, te) - 2, 4, 4, col);
+          }
+          ctx.globalAlpha = 1;
+        }
+
+        /* 通关覆盖 */
+        if(this.clearT > 0){
+          ctx.globalAlpha = clamp(1 - this.clearT / 0.5, 0, 1) * 0.6;
+          ctx.fillStyle = "#7cffb2"; ctx.fillRect(0, 0, W, H);
+          ctx.globalAlpha = 1;
+          text("过 关 !", HALF, H / 2, 46, "#0b0b14", "center");
+        }
+      }
+    };
+  }
+};
+
+/* ======================================================================
+   游戏 G：箭头开路 ARROW RUSH
+   规则：箭头朝哪个方向，就要求那条路到边缘完全通畅才能起飞。
+        点掉通畅的箭头，它飞出屏幕并让别的箭头"解锁"。
+        清空整盘过关。被挡住的箭头点不动。
+   难度：折磨优先。4x4 起手，一路长到 8x8（近 50 个箭头）；
+        每关限时，连快点出连击倍率，时间耗尽即结束。
+   关卡由"反向放置"生成：每个箭头落位时其路径必然通畅，
+        因此按落位逆序清空一定能通关 —— 保证有解，绝不死局。
+   ====================================================================== */
+Games.arrow = {
+  create(){
+    return {
+      COLS: 0, ROWS: 0, CELL: 0, ox: 0, oy: 0,
+      grid: [],
+      flying: [],
+      level: 1,
+      timeLeft: 0, timeMax: 0,
+      arrowsLeft: 0, arrowsTotal: 0,
+      combo: 0, comboT: 0, bestChain: 0,
+      clearT: 0,
+      solvedCount: 0,
+      blockMsgT: 0, blockAt: null,
+      lastClear: null,
+      t: 0,
+
+      init(app){
+        this.app = app;
+        this.level = this.level || 1;
+        this.solvedCount = 0;
+        this.t = 0;
+        this.buildLevel();
+      },
+      advance(){
+        this.level++;
+        this.solvedCount++;
+        this.buildLevel();
+        return this.level;
+      },
+
+      /* ---------- 关卡生成（反向放置，保证有解） ---------- */
+      buildLevel(){
+        const lv = this.level;
+        const DIRS = [[1,0],[-1,0],[0,1],[0,-1]];
+        /* 尺寸曲线：4 → 8，第 8 关起封顶 */
+        const size = lv <= 1 ? 4 : lv <= 3 ? 5 : lv <= 5 ? 6 : lv <= 7 ? 7 : 8;
+        this.COLS = size; this.ROWS = size;
+        this.CELL = Math.floor(Math.min((W - 40) / size, 400 / size));
+        this.ox = Math.floor((W - size * this.CELL) / 2);
+        /* 纵向居中于顶栏与底部提示之间 */
+        this.oy = Math.max(Y(132), Math.round((H - size * this.CELL) * 0.46));
+
+        const need = Math.floor(size * size * (lv <= 1 ? 0.72 : 0.82));
+        const cells = [];
+        for(let r = 0; r < size; r++) for(let c = 0; c < size; c++) cells.push([c, r]);
+        for(let i = cells.length - 1; i > 0; i--){ const j = (Math.random() * (i + 1)) | 0; [cells[i], cells[j]] = [cells[j], cells[i]]; }
+
+        const grid = Array.from({ length: size }, () => new Array(size).fill(null));
+        const pathClear = (c, r, dx, dy) => {
+          let x = c + dx, y = r + dy;
+          while(x >= 0 && x < size && y >= 0 && y < size){
+            if(grid[y][x]) return false;
+            x += dx; y += dy;
+          }
+          return true;
+        };
+        let placed = 0, cursor = 0, guard = 0;
+        while(placed < need && guard++ < 9000){
+          const [c, r] = cells[cursor % cells.length];
+          cursor++;
+          if(grid[r][c]) continue;
+          const opts = DIRS.filter(([dx, dy]) => pathClear(c, r, dx, dy));
+          if(!opts.length) continue;
+          const [dx, dy] = pick(opts);
+          grid[r][c] = {
+            dx, dy, alive: true, spawn: 0, blockT: 0,
+            color: dx === 1 ? 0 : dx === -1 ? 1 : dy === 1 ? 2 : 3
+          };
+          placed++;
+        }
+
+        this.grid = grid;
+        this.arrowsLeft = placed;
+        this.arrowsTotal = placed;
+        /* 限时：约每个箭头 1.05 秒起，越往后越紧（折磨曲线） */
+        const per = clamp(1.30 - lv * 0.045, 0.72, 1.30);
+        this.timeMax = placed * per;
+        this.timeLeft = this.timeMax;
+        this.flying = [];
+        this.clearT = 0;
+        this.combo = 0; this.comboT = 0; this.bestChain = 0;
+        this.blockMsgT = 0; this.blockAt = null;
+        this.lastClear = null;
+      },
+
+      colorOf(k){ return ["#4dd2ff", "#ff6ec7", "#ffd93d", "#7cffb2"][k % 4]; },
+
+      /* ---------- 判定 ---------- */
+      firstBlocker(c, r, dx, dy){
+        let x = c + dx, y = r + dy;
+        while(x >= 0 && x < this.COLS && y >= 0 && y < this.ROWS){
+          const g = this.grid[y][x];
+          if(g && g.alive) return [x, y];
+          x += dx; y += dy;
+        }
+        return null;
+      },
+      isFree(c, r){
+        const g = this.grid[r][c];
+        if(!g || !g.alive) return false;
+        return !this.firstBlocker(c, r, g.dx, g.dy);
+      },
+      freeCount(){
+        let n = 0;
+        for(let r = 0; r < this.ROWS; r++) for(let c = 0; c < this.COLS; c++) if(this.isFree(c, r)) n++;
+        return n;
+      },
+
+      /* ---------- 主循环 ---------- */
+      update(dt, app){
+        this.app = app;
+        this.t += dt;
+        if(this.comboT > 0){ this.comboT -= dt; if(this.comboT <= 0) this.combo = 0; }
+        if(this.blockMsgT > 0) this.blockMsgT -= dt;
+
+        /* 每帧只算一次"可点箭头"，绘制与判定共用（8x8 时不重复做 64 次射线扫描） */
+        this.freeMap = [];
+        for(let r = 0; r < this.ROWS; r++){
+          this.freeMap[r] = [];
+          for(let c = 0; c < this.COLS; c++) this.freeMap[r][c] = this.isFree(c, r);
+        }
+
+        /* 生成动画与抖动 */
+        for(let r = 0; r < this.ROWS; r++) for(let c = 0; c < this.COLS; c++){
+          const g = this.grid[r][c];
+          if(!g) continue;
+          if(g.spawn < 1) g.spawn = Math.min(1, g.spawn + dt * 2.6);
+          if(g.blockT > 0) g.blockT -= dt;
+        }
+        /* 飞出动画 */
+        for(let i = this.flying.length - 1; i >= 0; i--){
+          const f = this.flying[i];
+          f.t += dt;
+          if(f.t > 1.5){ this.flying.splice(i, 1); continue; }
+          f.cx = f.x + f.dx * 780 * f.t;
+          f.cy = f.y + f.dy * 780 * f.t;
+        }
+        /* 过关动画 */
+        if(this.clearT > 0){
+          this.clearT -= dt;
+          if(this.clearT <= 0) app.win(this.solvedCount + 1, "第 " + this.level + " 关已破");
+          return;              /* 过关动画期间冻结计时，避免"刚清完就判负" */
+        }
+        /* 计时 */
+        this.timeLeft -= dt;
+        if(this.timeLeft <= 0){
+          this.timeLeft = 0;
+          app.end(this.solvedCount);
+          return;
+        }
+        /* 输入 */
+        for(const tp of Input.taps){
+          const cell = this.cellAt(tp.x, tp.y);
+          if(!cell) continue;
+          this.tryFire(cell[0], cell[1], app);
+        }
+      },
+      cellAt(x, y){
+        const c = Math.floor((x - this.ox) / this.CELL);
+        const r = Math.floor((y - this.oy) / this.CELL);
+        if(c < 0 || c >= this.COLS || r < 0 || r >= this.ROWS) return null;
+        return [c, r];
+      },
+      tryFire(c, r, app){
+        const g = this.grid[r][c];
+        if(!g || !g.alive) return;
+        if(!this.isFree(c, r)){
+          /* 被挡住：点不动，抖一下并高亮挡路者 */
+          g.blockT = 0.36;
+          const bl = this.firstBlocker(c, r, g.dx, g.dy);
+          this.blockAt = bl ? [this.ox + bl[0] * this.CELL + this.CELL / 2, this.oy + bl[1] * this.CELL + this.CELL / 2] : null;
+          this.blockMsgT = 0.7;
+          this.combo = 0;
+          Sfx.fail(); Fx.addShake(4); buzz(18);
+          return;
+        }
+        /* 成功：一次只消一个 */
+        g.alive = false;
+        this.arrowsLeft--;
+        this.combo++;
+        this.comboT = 0.85;
+        this.bestChain = Math.max(this.bestChain, this.combo);
+        const col = this.colorOf(g.color);
+        const cx = this.ox + c * this.CELL + this.CELL / 2;
+        const cy = this.oy + r * this.CELL + this.CELL / 2;
+        this.flying.push({ x: cx, y: cy, dx: g.dx, dy: g.dy, color: col, t: 0, cx, cy });
+        Fx.burst(cx, cy, 7, col, 165);
+        if(this.combo >= 3){ Sfx.combo(this.combo); Fx.addShake(3 + Math.min(this.combo, 8)); }
+        else Sfx.good();
+        buzz(7);
+
+        /* 过关 */
+        if(this.arrowsLeft <= 0){
+          this.clearT = 0.45;
+          Sfx.win(); Fx.flash("#ffffff", 0.28); Fx.addShake(9);
+          const bonus = Math.max(0, this.timeLeft);
+          this.lastClear = { bonus };
+        }
+      },
+
+      hud(){
+        return "第 " + this.level + " 关 · 剩 " + this.arrowsLeft + "/" + this.arrowsTotal;
+      },
+
+      /* ---------- 绘制 ---------- */
+      draw(){
+        /* 盘面 */
+        const gw = this.COLS * this.CELL, gh = this.ROWS * this.CELL;
+        px(this.ox - 5, this.oy - 5, gw + 10, gh + 10, "#16162a");
+        for(let r = 0; r < this.ROWS; r++) for(let c = 0; c < this.COLS; c++){
+          const bx = this.ox + c * this.CELL, by = this.oy + r * this.CELL;
+          px(bx + 2, by + 2, this.CELL - 4, this.CELL - 4, (r + c) % 2 ? "#141426" : "#181830");
+        }
+
+        /* 时间条 + 进度条：紧贴顶栏下方 */
+        const barY = boardTop();
+        const tr = clamp(this.timeLeft / Math.max(0.001, this.timeMax), 0, 1);
+        const low = tr < 0.28;
+        px(40, barY, W - 80, 7, "#25253a");
+        px(40, barY, (W - 80) * tr, 7, low ? (Math.sin(this.t * 12) > 0 ? "#ff4d6d" : "#7a2a3a") : "#4dd2ff");
+        const ar = 1 - this.arrowsLeft / Math.max(1, this.arrowsTotal);
+        px(40, barY + 11, W - 80, 3, "#1a1a2e");
+        px(40, barY + 11, (W - 80) * ar, 3, "#7cffb2");
+        text(Math.ceil(this.timeLeft) + "s", 10, barY + 4, 11, low ? "#ff4d6d" : "#7a7a94", "left");
+        if(low && Math.sin(this.t * 12) > 0) text("时间告急", W - 10, barY + 4, 11, "#ff4d6d", "right");
+
+        /* 箭头 */
+        for(let r = 0; r < this.ROWS; r++) for(let c = 0; c < this.COLS; c++){
+          const g = this.grid[r][c];
+          if(!g || !g.alive) continue;
+          const cx = this.ox + c * this.CELL + this.CELL / 2;
+          const cy = this.oy + r * this.CELL + this.CELL / 2;
+          const s = easeOut(g.spawn) * (this.CELL * 0.6);
+          const free = this.freeMap[r] ? this.freeMap[r][c] : this.isFree(c, r);
+          const shaking = g.blockT > 0;
+          const sx = shaking ? rand(-4, 4) : 0;
+          /* 可点的箭头必须一眼可读：底色提亮 + 亮边框 + 呼吸 */
+          if(free && !shaking){
+            const pulse = 0.5 + 0.5 * Math.sin(this.t * 5 + (c + r) * 0.7);
+            const inset = this.CELL * 0.44;
+            ctx.globalAlpha = 0.20 + 0.26 * pulse;
+            px(cx - inset, cy - inset, inset * 2, inset * 2, "#ffffff");
+            ctx.globalAlpha = 0.55 + 0.45 * pulse;
+            ctx.strokeStyle = "#ffffff";
+            ctx.lineWidth = 2;
+            ctx.strokeRect(Math.round(cx - inset), Math.round(cy - inset), Math.round(inset * 2), Math.round(inset * 2));
+            ctx.globalAlpha = 1;
+          }
+          this.drawArrow(cx + sx, cy, s, g.dx, g.dy, shaking ? "#ff4d6d" : this.colorOf(g.color));
+        }
+        /* 飞出的箭头 */
+        for(const f of this.flying){
+          ctx.globalAlpha = clamp(1.5 - f.t, 0, 1);
+          this.drawArrow(f.cx, f.cy, this.CELL * 0.58, f.dx, f.dy, f.color);
+          ctx.globalAlpha = 1;
+        }
+        /* 被挡提示 */
+        if(this.blockMsgT > 0){
+          ctx.globalAlpha = clamp(this.blockMsgT / 0.35, 0, 1);
+          text("这条路被挡住了", HALF, Y(148), 15, "#ff4d6d", "center", "#400");
+          if(this.blockAt){
+            const s = 9 + (1 - this.blockMsgT / 0.7) * 11;
+            ctx.strokeStyle = "#ff4d6d"; ctx.lineWidth = 2;
+            ctx.strokeRect(this.blockAt[0] - s, this.blockAt[1] - s, s * 2, s * 2);
+          }
+          ctx.globalAlpha = 1;
+        }
+        /* 连击 */
+        if(this.comboT > 0 && this.combo >= 2){
+          const a = clamp(this.comboT / 0.6, 0, 1);
+          ctx.globalAlpha = a;
+          const mult = Math.min(this.combo, 9);
+          text(this.combo + " 连击  ×" + mult, HALF, Y(148), 17, "#ffd93d", "center", "#7a5c00");
+          ctx.globalAlpha = 1;
+        }
+        text("点亮路径通畅的箭头 · 一次消一个", HALF, H - 40, 11, "#5a5a76", "center");
+
+        if(this.clearT > 0){
+          ctx.globalAlpha = clamp(1 - this.clearT / 0.45, 0, 1) * 0.7;
+          ctx.fillStyle = "#4dd2ff"; ctx.fillRect(0, 0, W, H);
+          ctx.globalAlpha = 1;
+          text("过 关 !", HALF, H / 2, 44, "#0b0b14", "center");
+        }
+      },
+      /* 像素三角箭头 */
+      drawArrow(cx, cy, s, dx, dy, color){
+        const n = 5, half = s / 2;
+        ctx.fillStyle = color;
+        for(let i = 0; i < n; i++){
+          const t = i / (n - 1);
+          const w = half * (1 - t);
+          if(dx === 1) ctx.fillRect(Math.round(cx - half + t * s), Math.round(cy - w), Math.ceil(s / n) + 1, Math.max(2, w * 2));
+          else if(dx === -1) ctx.fillRect(Math.round(cx + half - t * s - s / n), Math.round(cy - w), Math.ceil(s / n) + 1, Math.max(2, w * 2));
+          else if(dy === 1) ctx.fillRect(Math.round(cx - w), Math.round(cy - half + t * s), Math.max(2, w * 2), Math.ceil(s / n) + 1);
+          else ctx.fillRect(Math.round(cx - w), Math.round(cy + half - t * s - s / n), Math.max(2, w * 2), Math.ceil(s / n) + 1);
+        }
+        ctx.fillStyle = "rgba(255,255,255,.45)";
+        if(dx !== 0) ctx.fillRect(Math.round(cx - half), Math.round(cy - 1), Math.round(s * 0.5), 2);
+        else ctx.fillRect(Math.round(cx - 1), Math.round(cy - half), 2, Math.round(s * 0.5));
+      }
+    };
+  }
+};
+/* ======================================================================
+   游戏 H：一指点色 TAP DASH
+   规则：4 条轨道，方块从上方落下。点某条轨道 = 摧毁该轨道最下方方块。
+        方块触底即结束。同色连击加分。
+   难度：折磨优先。第 10 秒起速度暴涨，容错窗口极小。
+   ====================================================================== */
+Games.dash = {
+  create(){
+    return {
+      LANES: 4,
+      lanes: [],         // 每条轨道一个方块数组
+      laneW: 0,
+      speed: 0,
+      spawnT: 0,
+      score: 0,
+      combo: 0,
+      maxCombo: 0,
+      elapsed: 0,
+      judgeY: 0,
+      hitFx: [],
+      lastColor: -1,
+      init(app){
+        this.app = app;
+        this.LANES = 4;
+        this.laneW = W / this.LANES;
+        this.lanes = Array.from({ length: this.LANES }, () => []);
+        this.speed = 92;
+        this.spawnT = 0.5;
+        this.score = 0; this.combo = 0; this.maxCombo = 0; this.elapsed = 0;
+        this.judgeY = H - 150;
+        this.hitFx = [];
+        this.dead = false;
+        this.bh = 46;                      // 方块高度
+      },
+      update(dt, app){
+        if(this.dead) return;
+        this.elapsed += dt;
+        /* 折磨曲线：速度随时间指数上涨，60 秒后几乎不可能 */
+        this.speed = 92 + Math.pow(this.elapsed, 1.42) * 7.5 + this.elapsed * 12;
+        this.spawnT -= dt;
+
+        const spawnGap = Math.max(0.16, 0.78 - this.elapsed * 0.016);
+        if(this.spawnT <= 0){
+          this.spawnT = spawnGap * rand(0.82, 1.18);
+          this.spawnBlock();
+        }
+        /* 移动 */
+        for(const lane of this.lanes){
+          for(const b of lane){
+            b.y += this.speed * dt;
+            b.wob += dt * 6;
+          }
+        }
+        /* 触底判定 */
+        for(let li = 0; li < this.LANES; li++){
+          const lane = this.lanes[li];
+          if(lane.length && lane[0].y + this.bh >= H - 54){
+            this.dead = true;
+            Fx.addShake(18); Sfx.fail(); buzz([40, 50, 80]);
+            Fx.flash("#ff4d6d", 0.3);
+            app.end(this.score);
+            return;
+          }
+        }
+        /* 特效 */
+        for(let i = this.hitFx.length - 1; i >= 0; i--){
+          this.hitFx[i].t += dt;
+          if(this.hitFx[i].t > 0.35) this.hitFx.splice(i, 1);
+        }
+        /* 输入 */
+        for(const tp of Input.taps){
+          const li = clamp(Math.floor(tp.x / this.laneW), 0, this.LANES - 1);
+          this.tapLane(li, app);
+        }
+      },
+      spawnBlock(){
+        const li = randi(0, this.LANES - 1);
+        const lane = this.lanes[li];
+        /* 避免同轨堆叠过密导致必死 */
+        if(lane.length >= 3) return;
+        const color = randi(0, 3);
+        lane.push({ y: -this.bh, color, wob: rand(0, 6), lane: li });
+      },
+      tapLane(li, app){
+        const lane = this.lanes[li];
+        if(!lane.length) { this.combo = 0; Sfx.tap(); return; }
+        /* 摧毁最下方（最接近判定线）的方块 */
+        const b = lane[0];
+        /* 判断是否击中窗口：距离判定线越近分越高 */
+        const dist = (H - 54) - (b.y + this.bh);
+        const near = clamp(1 - dist / 260, 0, 1);
+        lane.shift();
+        const sameColor = b.color === this.lastColor;
+        this.combo = sameColor ? this.combo + 1 : 1;
+        this.maxCombo = Math.max(this.maxCombo, this.combo);
+        const pts = Math.round(10 + near * 40) * Math.min(this.combo, 8);
+        this.score += pts;
+        this.lastColor = b.color;
+        const col = ["#ff4d6d", "#4dd2ff", "#ffd93d", "#7cffb2"][b.color];
+        this.hitFx.push({ x: li * this.laneW + this.laneW / 2, y: b.y + this.bh / 2, t: 0, color: col });
+        Fx.burst(li * this.laneW + this.laneW / 2, b.y + this.bh / 2, 10, col, 180);
+        if(this.combo > 1){ Sfx.combo(this.combo); } else Sfx.good();
+        Fx.addShake(2 + near * 4); buzz(near > 0.7 ? 14 : 6);
+        if(near > 0.88){ Fx.flash(col, 0.10); Sfx.perfect(); }
+      },
+      hud(){ return this.score + " 分"; },
+      draw(){
+        /* 轨道背景 */
+        for(let i = 0; i < this.LANES; i++){
+          px(i * this.laneW + 2, 0, this.laneW - 4, H, i % 2 ? "#101020" : "#0e0e1c");
+        }
+        /* 判定线 */
+        const jy = H - 54;
+        const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 8);
+        ctx.globalAlpha = 0.55 + pulse * 0.45;
+        px(0, jy, W, 3, "#ff4d6d");
+        ctx.globalAlpha = 1;
+        /* 危险区渐变 */
+        for(let i = 0; i < 12; i++){
+          ctx.globalAlpha = 0.03 + i * 0.012;
+          px(0, jy - i * 8 - 8, W, 8, "#ff4d6d");
+        }
+        ctx.globalAlpha = 1;
+
+        /* 方块 */
+        for(const lane of this.lanes){
+          for(const b of lane){
+            const x = b.lane * this.laneW + 5;
+            const w = this.laneW - 10;
+            const col = ["#ff4d6d", "#4dd2ff", "#ffd93d", "#7cffb2"][b.color];
+            block(x, b.y, w, this.bh, col, "rgba(255,255,255,.35)", "rgba(0,0,0,.35)");
+            /* 内部像素装饰 */
+            px(x + 6, b.y + 8, w - 12, 3, "rgba(255,255,255,.25)");
+          }
+        }
+        /* 命中特效 */
+        for(const f of this.hitFx){
+          const a = 1 - f.t / 0.35;
+          ctx.globalAlpha = a;
+          px(f.x - 30, f.y, 60, 2, f.color);
+          px(f.x - 20, f.y - 6, 40, 2, f.color);
+          px(f.x - 20, f.y + 6, 40, 2, f.color);
+          text("+" + Math.round(a * 40), f.x, f.y - 20, 12, f.color, "center");
+          ctx.globalAlpha = 1;
+        }
+        /* 连击 */
+        if(this.combo > 1){
+          text(this.combo + " COMBO", HALF, 96, 20, "#ffd93d", "center", "#7a5c00");
+        }
+        text("速度 ×" + (this.speed / 92).toFixed(1), 14, H - 30, 11, this.speed > 260 ? "#ff4d6d" : "#5a5a76", "left");
+        text("时长 " + this.elapsed.toFixed(1) + "s", W - 14, H - 30, 11, "#5a5a76", "right");
+      }
+    };
+  }
+};
+
+/* ======================================================================
+   游戏 I：像素跳跃 JUMP STACK
+   规则：长按蓄力，松手起跳。落在平台上得分，落在正中间额外奖励。
+        掉下去即结束。
+   难度：折磨优先。平台越来越窄、还会左右移动。
+   ====================================================================== */
+Games.jump = {
+  create(){
+    return {
+      plats: [],
+      player: { x: 0, y: 0, vx: 0, vy: 0, onGround: true, squash: 0 },
+      charge: 0, charging: false,
+      camY: 0,
+      targetCamY: 0,
+      score: 0, combo: 0,
+      MAXJUMP: 300,
+      GRAV: 1500,
+      over: false,
+      init(app){
+        this.app = app;
+        this.plats = [];
+        this.baseW = 96;
+        this.perfectMsg = { t: 0, text: "" };
+        const start = { x: W / 2 - 48, y: H - 170, w: 96, h: 16, mw: 0, vx: 0 };
+        this.plats.push(start);
+        this.player.x = W / 2; this.player.y = start.y;
+        this.player.vx = 0; this.player.vy = 0;
+        this.player.onGround = true;
+        this.camY = 0; this.targetCamY = 0;
+        this.score = 0; this.combo = 0; this.over = false;
+        this.spawnNext();
+      },
+      spawnNext(){
+        const last = this.plats[this.plats.length - 1];
+        const lv = this.plats.length;
+        const w = clamp(this.baseW - lv * 1.6, 26, 96);
+        const gap = clamp(70 + lv * 3.5, 70, 230);
+        const nx = clamp(last.x + last.w / 2 + rand(-90, 90) - w / 2, 20, W - w - 20);
+        const ny = last.y - gap;
+        const moving = lv > 6 && Math.random() < clamp(0.15 + lv * 0.03, 0, 0.6);
+        this.plats.push({
+          x: nx, y: ny, w, h: 16, mw: nx,
+          vx: moving ? (Math.random() < 0.5 ? -1 : 1) * rand(26, 26 + lv * 3) : 0,
+          range: moving ? rand(24, 60) : 0
+        });
+      },
+      update(dt, app){
+        if(this.over) return;
+        this.t = (this.t || 0) + dt;
+        if(this.perfectMsg.t > 0) this.perfectMsg.t -= dt;
+        const p = this.player;
+        /* 蓄力 */
+        if(Input.down){
+          this.charging = true;
+          this.charge = Math.min(1, this.charge + dt * 1.35);
+          p.squash = this.charge;
+        }
+        if(Input.released && this.charging){
+          this.charging = false;
+          if(p.onGround){
+            p.vy = -this.MAXJUMP * 0.62 * (0.35 + this.charge * 0.65) - 120;
+            p.vx = rand(-18, 18);
+            p.onGround = false;
+            Sfx.good(); buzz(12);
+            Fx.addShake(3 + this.charge * 5);
+            const pc = this.plats.find(pl => p.y >= pl.y - 2 && p.y <= pl.y + pl.h + 8 && p.x >= pl.x && p.x <= pl.x + pl.w);
+            if(pc) Fx.burst(p.x, pc.y, 8, "#7cffb2", 130);
+          }
+          this.charge = 0; p.squash = 0;
+        }
+        /* 移动平台 */
+        if(!p.onGround){
+          for(const pl of this.plats){
+            if(pl.vx){ pl.mw += pl.vx * dt; pl.x += pl.vx * dt; }
+          }
+          for(const pl of this.plats){
+            if(pl.range && (pl.x < pl.mw - pl.range || pl.x > pl.mw + pl.range)){ pl.vx *= -1; }
+          }
+        }
+        if(!p.onGround){
+          p.vy += this.GRAV * dt;
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+          /* 撞墙 */
+          if(p.x < 8){ p.x = 8; p.vx = Math.abs(p.vx) * 0.4; }
+          if(p.x > W - 8){ p.x = W - 8; p.vx = -Math.abs(p.vx) * 0.4; }
+          /* 落地检测（只在下落时） */
+          if(p.vy > 0){
+            for(const pl of this.plats){
+              if(p.y >= pl.y && p.y <= pl.y + pl.h + Math.abs(p.vy) * dt + 6 &&
+                 p.x >= pl.x - 6 && p.x <= pl.x + pl.w + 6){
+                this.land(pl, app);
+                break;
+              }
+            }
+          }
+          /* 掉出屏幕 */
+          if(p.y > this.camY + H + 60){
+            this.over = true;
+            Fx.addShake(16); Sfx.fail(); buzz([40, 50, 80]);
+            app.end(this.score);
+            return;
+          }
+        }
+        /* 相机跟随：玩家始终在屏幕下方 1/3 附近 */
+        this.targetCamY = Math.min(this.camY, p.y - (H * 0.66));
+        this.camY = lerp(this.camY, this.targetCamY, clamp(dt * 7, 0, 1));
+        /* 补平台 */
+        while(this.plats[this.plats.length - 1].y > this.camY - 60) this.spawnNext();
+        /* 清理在屏幕下方的旧平台 */
+        while(this.plats.length > 3 && this.plats[0].y > this.camY + H + 200) this.plats.shift();
+      },
+      land(pl, app){
+        const p = this.player;
+        p.y = pl.y; p.vy = 0; p.vx = 0; p.onGround = true;
+        const center = pl.x + pl.w / 2;
+        const off = Math.abs(p.x - center);
+        const perfect = off < 9;
+        /* 计分：越高越值钱，正中心翻倍 */
+        const idx = this.plats.indexOf(pl);
+        const base = 10 + Math.max(0, idx) * 2;
+        if(perfect){
+          this.combo++;
+          this.score += base * 2 * Math.min(this.combo, 5);
+          Sfx.perfect(); Fx.flash("#ffd93d", 0.14); Fx.addShake(7); buzz([10, 20]);
+          Fx.burst(center, pl.y, 20, "#ffd93d", 240);
+        } else {
+          this.combo = 0;
+          this.score += base;
+          Sfx.place(); Fx.addShake(3); buzz(8);
+          Fx.burst(p.x, pl.y, 8, "#7cffb2", 140);
+        }
+        this.perfectMsg = { t: perfect ? 0.8 : 0, text: perfect ? "PERFECT!" : "" };
+        /* 每落一次生成新平台，保持前方有目标 */
+        const lastY = this.plats[this.plats.length - 1].y;
+        if(pl.y <= lastY + 200) this.spawnNext();
+      },
+      hud(){ return this.score + " 层"; },
+      draw(){
+        ctx.save();
+        ctx.translate(0, -this.camY);
+        /* 平台 */
+        for(const pl of this.plats){
+          const onScreen = pl.y > this.camY - 40 && pl.y < this.camY + H + 40;
+          if(!onScreen) continue;
+          block(pl.x, pl.y, pl.w, pl.h, "#3a3a5c", "#6a6a9c", "#1a1a2e");
+          px(pl.x + 2, pl.y + 2, pl.w - 4, 3, "#7cffb2");
+          /* 中心标记 */
+          px(pl.x + pl.w / 2 - 1, pl.y + 3, 2, 6, "#ffd93d");
+        }
+        /* 玩家 */
+        const p = this.player;
+        const sq = p.squash;
+        const pw = 22 + sq * 8, ph = 26 - sq * 10;
+        const pxr = p.x - pw / 2, pyr = p.y - ph;
+        /* 蓄力指示 */
+        if(this.charging && p.onGround){
+          const barW = 60;
+          px(p.x - barW / 2, pyr - 16, barW, 5, "#25253a");
+          px(p.x - barW / 2, pyr - 16, barW * this.charge, 5, this.charge > 0.85 ? "#ff4d6d" : "#7cffb2");
+          /* 预测落点 */
+          ctx.globalAlpha = 0.25;
+          const dist = this.MAXJUMP * 0.62 * (0.35 + this.charge * 0.65);
+          px(p.x - 12, p.y - dist * 0.55, 24, 3, "#ffd93d");
+          ctx.globalAlpha = 1;
+        }
+        block(pxr, pyr, pw, ph, "#7cffb2", "rgba(255,255,255,.45)", "rgba(0,0,0,.4)");
+        /* 眼睛（像素） */
+        px(pxr + 5, pyr + 8, 4, 5, "#0b0b14");
+        px(pxr + pw - 9, pyr + 8, 4, 5, "#0b0b14");
+        ctx.restore();
+
+        /* 高度计：从起始平台算起 */
+        const groundY = this.plats.length ? this.plats[0].y : H - 170;
+        const height = Math.max(0, Math.round((groundY - this.player.y) / 10));
+        text("高度 " + height + " m", HALF, Y(96), 13, "#7a7a94", "center");
+        if(this.combo > 1)
+          text(this.combo + " 次完美", HALF, Y(120), 15, "#ffd93d", "center", "#7a5c00");
+        if(this.perfectMsg && this.perfectMsg.t > 0){
+          ctx.globalAlpha = clamp(this.perfectMsg.t / 0.4, 0, 1);
+          text("PERFECT!", HALF, H / 2 - 60, 30, "#ffd93d", "center", "#7a5c00");
+          ctx.globalAlpha = 1;
+        }
+        text("按住蓄力 · 松手起跳 · 落在正中间加倍", HALF, H - 40, 11, "#5a5a76", "center");
+      }
+    };
+  }
+};
+
+/* ======================================================================
+   主循环
+   ====================================================================== */
+let lastT = performance.now();
+let dtGlobal = 0;
+
+function frame(now){
+  let dt = (now - lastT) / 1000;
+  lastT = now;
+  if(dt > 0.05) dt = 0.05;        // 卡顿保护，防止物理穿透
+  dtGlobal = dt;
+
+  Fx.update(dt);
+  if(App.scene){
+    if(App.scene.draw) App.scene.update(dt);
+    App.scene.draw(ctx);
+  }
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+/* ======================================================================
+   启动
+   ====================================================================== */
+Save.load();
+resize();
+
+/* 支持 URL hash 直达，便于分享与调试：
+   #home            -> 游戏列表
+   #game/sort       -> 直接进入某款游戏
+   #game/arrow/3    -> 从第 3 关开始                                     */
+function routeFromHash(){
+  const h = (location.hash || "").replace(/^#\/?/, "");
+  if(!h || h === "title") return App.go("title");
+  const parts = h.split("/");
+  if(parts[0] === "home") return App.go("home");
+  if(parts[0] === "game"){
+    const g = GAMES.find(x => x.id === parts[1]);
+    if(g){
+      const lv = parseInt(parts[2], 10);
+      return App.go("game", { id: g.id, level: (isFinite(lv) && lv > 0) ? lv : 1 });
+    }
+  }
+  return App.go("title");
+}
+routeFromHash();
+window.addEventListener("hashchange", routeFromHash);
+
+requestAnimationFrame(frame);
+
+/* 首次交互解锁音频 */
+function unlock(){ Sfx.init(); Sfx.resume(); window.removeEventListener("touchstart", unlock); window.removeEventListener("mousedown", unlock); }
+window.addEventListener("touchstart", unlock, { passive: true });
+window.addEventListener("mousedown", unlock);
+
+/* 注册 Service Worker（离线可用）。
+   状态写入 PWA.status，可在首页底部看到——部署后判断离线是否生效就靠它。 */
+const PWA = { status: "未启用", detail: "" };
+if("serviceWorker" in navigator){
+  if(location.protocol.startsWith("http")){
+    window.addEventListener("load", () => {
+      PWA.status = "注册中";
+      navigator.serviceWorker.register("./sw.js").then((reg) => {
+        const mark = () => {
+          if(reg.active){
+            PWA.status = navigator.serviceWorker.controller ? "离线已就绪" : "离线已就绪(刷新后接管)";
+            PWA.detail = "scope " + new URL(reg.scope).pathname;
+          } else {
+            PWA.status = "安装中";
+            setTimeout(mark, 400);
+          }
+        };
+        mark();
+      }).catch((err) => {
+        PWA.status = "注册失败";
+        PWA.detail = String(err && err.message || err).slice(0, 40);
+      });
+    });
+  } else {
+    PWA.status = "需 http/https";
+    PWA.detail = "当前为 " + location.protocol + "，file:// 下离线缓存不可用";
+  }
+} else {
+  PWA.status = "浏览器不支持";
+}
+</script>
+</body>
+</html>
