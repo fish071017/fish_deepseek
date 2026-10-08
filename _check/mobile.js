@@ -1,4 +1,4 @@
-﻿/* 真机验证：用 CDP 驱动 Edge，模拟触摸，验证四款游戏都可玩。
+/* 真机验证：用 CDP 驱动 Edge，模拟触摸，验证四款游戏都可玩。
    关注的是"游戏状态是否变化"，而不是任何瞬时中间态。
 
    两个曾经把我带偏的坑，写在这里备查：
@@ -173,22 +173,6 @@ const bad = (m) => { fail++; console.log("    [FAIL] " + m); };
       }
     }
 
-    /* 箭头 */
-    if(await gotoGame("arrow") !== "game") bad("箭头开路: 无法进入");
-    else {
-      const tgt = await ev(`(() => { const m = App.scene.mod;
-        for(let r=0;r<m.ROWS;r++) for(let c=0;c<m.COLS;c++) if(m.isFree(c,r))
-          return { x: m.ox+c*m.CELL+m.CELL/2, y: m.oy+r*m.CELL+m.CELL/2, n: m.arrowsLeft };
-        return null; })()`);
-      if(!tgt || tgt.__err) bad("箭头开路: 无通畅箭头");
-      else {
-        await tap(tgt.x, tgt.y, 420);
-        const after = await ev("App.scene.mod.arrowsLeft");
-        (after === tgt.n - 1) ? ok("箭头开路: 消掉 1 个箭头 " + tgt.n + " -> " + after)
-                              : bad("箭头开路: " + tgt.n + " -> " + after + "（应减 1）");
-      }
-    }
-
     /* 点色：点颜色按钮，消掉该颜色的方块 */
     if(await gotoGame("dash") !== "game") bad("一指点色: 无法进入");
     else {
@@ -219,6 +203,9 @@ const bad = (m) => { fail++; console.log("    [FAIL] " + m); };
           return null;
         })()`);
         if(miss){
+          /* 冻结生成，消除"读颜色→派发点击"之间的竞态 */
+          await ev("App.scene.mod.spawnPaused = true");
+          await sleep(120);
           const sc = await ev("App.scene.mod.score");
           /* 记录点击瞬间场上有哪些颜色，用来判断"点错"是否真的错 */
           const before = await ev(`(() => { const m = App.scene.mod; const h=[0,0,0,0];
@@ -238,26 +225,58 @@ const bad = (m) => { fail++; console.log("    [FAIL] " + m); };
       }
     }
 
-    /* 跳跃 */
+    /* 跳跃：自动吸附 + 岩浆上升 + 起跳得分 */
     if(await gotoGame("jump") !== "game") bad("像素跳跃: 无法进入");
     else {
-      /* 物理自检：满蓄力高度必须明显大于平台间距，否则必定跳不上去 */
+      await sleep(600);
+      /* 物理自检：满蓄力必须够得着最大平台间距 */
       const phys = await ev(`(() => {
         const m = App.scene.mod;
         const v = m.jumpVelocity(1);
         const h = (v * v) / (2 * m.GRAV);
         let maxGap = 0;
         for(let i = 1; i < m.plats.length; i++) maxGap = Math.max(maxGap, m.plats[i-1].y - m.plats[i].y);
-        return { minH: Math.round((m.jumpVelocity(0)**2)/(2*m.GRAV)), maxH: Math.round(h), maxGap: Math.round(maxGap) };
+        return { maxH: Math.round(h), maxGap: Math.round(maxGap),
+                 hasSnap: typeof m.nextPlatformAbove === "function",
+                 hazard: m.hazardY, camY: m.camY };
       })()`);
-      (phys.maxH > phys.maxGap) ? ok("像素跳跃: 满蓄力可跳 " + phys.maxH + "px > 最大间距 " + phys.maxGap + "px")
-                                : bad("像素跳跃: 满蓄力只跳 " + phys.maxH + "px，平台间距 " + phys.maxGap + "px —— 跳不上去");
+      (phys.maxH > phys.maxGap) ? ok("像素跳跃: 满蓄力 " + phys.maxH + "px > 最大间距 " + phys.maxGap + "px")
+                                : bad("像素跳跃: 跳不上去（" + phys.maxH + " vs " + phys.maxGap + "）");
+      phys.hasSnap ? ok("像素跳跃: 自动吸附目标已就绪") : bad("像素跳跃: 缺少吸附逻辑");
+
+      /* 岩浆必须随时间上升 */
+      const hz1 = await ev("App.scene.mod.hazardY");
+      await sleep(1200);
+      const hz2 = await ev("App.scene.mod.hazardY");
+      (hz2 < hz1) ? ok("像素跳跃: 岩浆持续上升 " + Math.round(hz1) + " -> " + Math.round(hz2))
+                  : bad("像素跳跃: 岩浆没有上升（" + hz1 + " -> " + hz2 + "）");
+
+      /* 起跳后应得分，并检查横向吸附是否把玩家带向平台 */
       const b = await ev("App.scene.mod.score");
-      const ground = await ev("App.scene.mod.player.onGround");
-      await tapHold(180, 420, 620, 1800);
-      const a = await ev("App.scene.mod.score");
-      (a > b) ? ok("像素跳跃: 蓄力起跳 " + b + " -> " + a)
-              : bad("像素跳跃: 得分未变（" + b + "，起跳前 onGround=" + ground + "）");
+      /* 起跳前记录位置，确认真的离地了 */
+      const y0 = await ev("App.scene.mod.player.y");
+      await tapHold(180, 420, 620, 400);
+      const airborne = await ev("!App.scene.mod.player.onGround");
+      /* 落地需要时间，轮询等待得分变化 */
+      let a = b;
+      for(let i = 0; i < 12 && a === b; i++){ await sleep(250); a = await ev("App.scene.mod.score"); }
+      const y1 = await ev("App.scene.mod.player.y");
+      airborne ? ok("像素跳跃: 起跳后离地") : bad("像素跳跃: 起跳后仍在地面");
+      (a > b) ? ok("像素跳跃: 蓄力起跳得分 " + b + " -> " + a + "（y " + Math.round(y0) + " -> " + Math.round(y1) + "）")
+              : bad("像素跳跃: 得分未变（" + b + "，y " + Math.round(y0) + " -> " + Math.round(y1) +
+                    "，岩浆 " + Math.round(await ev("App.scene.mod.hazardY")) + "）");
+
+      /* 粒子坐标：应为屏幕坐标（接近玩家在屏幕上的位置） */
+      const pj = await ev(`(() => {
+        const m = App.scene.mod;
+        const fx = Fx.particles.filter(p => p.color === "#7cffb2" || p.color === "#ffd93d");
+        if(!fx.length) return { n: 0 };
+        const onScreen = fx.filter(p => p.y >= 0 && p.y <= H).length;
+        return { n: fx.length, onScreen, sample: Math.round(fx[0].y), camY: Math.round(m.camY), H: H };
+      })()`);
+      if(pj.n === 0) ok("像素跳跃: 粒子已消散（无可检对象）");
+      else (pj.onScreen === pj.n) ? ok("像素跳跃: 粒子在屏幕内（无错位）" + JSON.stringify(pj))
+                                  : bad("像素跳跃: 粒子跑到屏幕外 " + JSON.stringify(pj));
     }
   }
 
@@ -272,6 +291,8 @@ const bad = (m) => { fail++; console.log("    [FAIL] " + m); };
   ws.close(); child.kill(); await sleep(300);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.log("脚本失败: " + e.message); process.exit(1); });
+
+
 
 
 

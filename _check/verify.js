@@ -128,26 +128,46 @@ console.log("脚本加载: OK   W=" + ev("W") + " H=" + ev("H"));
         }
         legalSum += legal;
 
-        /* 贪心求解 */
-        let guard = 0;
-        while(guard++ < 6000){
-          if(m.isSolved()){ solvedByGreedy++; break; }
-          const cands = [];
+        /* 求解器：带启发式的深度优先 + 访问去重。
+           纯贪心在 15 根管的盘面上会走进死胡同（并非关卡无解），
+           所以这里用更强一点的回溯搜索来验证"确实有解"。 */
+        const key = () => m.tubes.map(t => t.blocks.join(",")).sort().join("|");
+        const visited = new Set();
+        let nodes = 0;
+        const dfs = (depth) => {
+          if(m.isSolved()) return true;
+          if(depth > 220 || nodes++ > 20000) return false;
+          const k = key();
+          if(visited.has(k)) return false;
+          visited.add(k);
+          const moves = [];
           for(let f = 0; f < n; f++) for(let t = 0; t < n; t++){
             if(f === t) continue;
             const from = m.tubes[f], to = m.tubes[t];
             if(!from.blocks.length || to.blocks.length >= m.CAP || m.isDone(from)) continue;
             const cf = m.topColor(from), ct = m.topColor(to);
             if(to.blocks.length > 0 && cf !== ct) continue;
+            /* 整管倒进空管是无意义的搬运，剪掉 */
             if(to.blocks.length === 0 && m.topRun(from) === from.blocks.length) continue;
-            cands.push([f, t]);
+            moves.push([f, t]);
           }
-          if(!cands.length) break;
-          const f = cands[0][0], t = cands[0][1];
-          const from = m.tubes[f], to = m.tubes[t];
-          const cnt = Math.min(m.topRun(from), m.CAP - to.blocks.length);
-          for(let i = 0; i < cnt; i++) to.blocks.push(from.blocks.pop());
-        }
+          /* 启发式：优先"能凑满一管"的走法 */
+          moves.sort((a, b) => {
+            const sa = m.topRun(m.tubes[a[0]]) + (m.tubes[a[1]].length ? 1 : 0);
+            const sb = m.topRun(m.tubes[b[0]]) + (m.tubes[b[1]].length ? 1 : 0);
+            return sb - sa;
+          });
+          for(const [f, t] of moves){
+            const from = m.tubes[f], to = m.tubes[t];
+            const cnt = Math.min(m.topRun(from), m.CAP - to.blocks.length);
+            const backup = [];
+            for(let i = 0; i < cnt; i++){ const b = from.blocks.pop(); to.blocks.push(b); backup.push(b); }
+            if(dfs(depth + 1)) return true;
+            for(let i = 0; i < cnt; i++){ to.blocks.pop(); from.blocks.push(backup.pop()); }
+          }
+          return false;
+        };
+        if(dfs(0)) solvedByGreedy++;
       }
       return { solvedAtStart, solvedByGreedy, total, tubes, avgLegal: legalSum / total };
     })()`);
@@ -162,59 +182,56 @@ console.log("脚本加载: OK   W=" + ev("W") + " H=" + ev("H"));
   console.log(bad === 0 ? "  >>> 开局都未完成，且全部可解" : "  >>> 有 " + bad + " 关存在问题");
 })();
 
-/* ================= 2. 箭头：零死局 ================= */
-(function testArrow(){
-  console.log("\n=== 箭头开路：任意顺序清空率（必须 100%） ===");
+/* ================= 2. 试管：打乱质量（不能一开局就一堆纯色完成管） ================= */
+(function testSortMix(){
+  console.log("\n=== 像素试管：打乱质量 + 空管数量 ===");
   let bad = 0;
   for(let lv = 1; lv <= 14; lv++){
     const r = ev(`(function(){
-      let ok = 0, total = 0, arrows = 0, minFree = 1e9, freeSum = 0, samples = 0;
-      for(let trial = 0; trial < 30; trial++){
-        const m = Games.arrow.create();
-        m.app = { win(){}, end(){}, go(){}, scene: null };
+      let pureAvg = 0, emptyAvg = 0, mixedAvg = 0, tubesAvg = 0, n = 0, worst = 99;
+      for(let trial = 0; trial < 40; trial++){
+        const m = Games.sort.create();
         m.level = ${lv};
         m.buildLevel();
-        total++; arrows += m.arrowsLeft;
-        minFree = Math.min(minFree, m.freeCount());
-        let guard = 0, dead = false;
-        while(m.arrowsLeft > 0 && guard++ < 5000){
-          const fm = [];
-          for(let rr = 0; rr < m.ROWS; rr++) for(let cc = 0; cc < m.COLS; cc++) if(m.isFree(cc, rr)) fm.push([cc, rr]);
-          if(!fm.length){ dead = true; break; }
-          freeSum += fm.length; samples++;
-          const pickIdx = (Math.random() * fm.length) | 0;
-          m.tryFire(fm[pickIdx][0], fm[pickIdx][1], m.app);
+        m.layout = function(){};
+        let empty = 0, pure = 0, mixed = 0;
+        for(const tb of m.tubes){
+          if(tb.blocks.length === 0) empty++;
+          else if(new Set(tb.blocks).size === 1) pure++;
+          else mixed++;
         }
-        if(dead || m.arrowsLeft > 0) { /* 死局 */ } else ok++;
+        pureAvg += pure; emptyAvg += empty; mixedAvg += mixed;
+        tubesAvg += m.tubes.length;
+        worst = Math.min(worst, mixed);
+        n++;
       }
-      return { ok, total, arrows, minFree, avgFree: freeSum / Math.max(1, samples) };
+      return { pure: pureAvg/n, empty: emptyAvg/n, mixed: mixedAvg/n, tubes: tubesAvg/n, worst };
     })()`);
-    if(r.ok !== r.total) bad++;
-    console.log("  第 " + String(lv).padStart(2) + " 关 | 箭头均 " + String(Math.round(r.arrows / r.total)).padStart(2) +
-                " | 起手可选 " + String(r.minFree).padStart(2) +
-                " | 平均可选 " + r.avgFree.toFixed(2) +
-                " | 清空 " + (r.ok / r.total * 100).toFixed(1) + "%" + (r.ok === r.total ? "  [OK]" : "  [FAIL]"));
+    /* 至少要有 2 根"混色"管可以操作，且空管不少于 2 根 */
+    const okMix = r.worst >= 1 && r.mixed >= 2;
+    const okEmpty = r.empty >= 2;
+    if(!okMix || !okEmpty) bad++;
+    console.log("  第 " + String(lv).padStart(2) + " 关 | 试管 " + r.tubes.toFixed(0) +
+                " | 空管 " + r.empty.toFixed(1) +
+                " | 混色管 " + r.mixed.toFixed(1) + " (最少 " + r.worst + ")" +
+                " | 纯色 " + r.pure.toFixed(1) +
+                (okMix && okEmpty ? "  [OK]" : "  [FAIL]"));
   }
-  console.log(bad === 0 ? "  >>> 零死局，全部可清空" : "  >>> 有 " + bad + " 关存在死局");
+  console.log(bad === 0 ? "  >>> 空管充足、开局面板是打乱的" : "  >>> 有 " + bad + " 关打乱不足");
 })();
 
 /* ================= 3. 过关续关 ================= */
 (function testAdvance(){
-  const a = ev(`(function(){
-    const m = Games.arrow.create(); m.app = { win(){},end(){},go(){} }; m.level = 3; m.buildLevel();
-    return [m.advance(), m.advance()];
-  })()`);
   const s = ev(`(function(){
     const m = Games.sort.create(); m.layout = function(){}; m.app = { win(){},end(){},go(){} };
     m.level = 2; m.buildLevel();
     return [m.advance()];
   })()`);
   console.log("\n=== 过关续关 ===");
-  console.log("  箭头: 3 -> " + a[0] + " -> " + a[1] + (a[0] === 4 && a[1] === 5 ? "  [OK]" : "  [FAIL]"));
   console.log("  试管: 2 -> " + s[0] + (s[0] === 3 ? "  [OK]" : "  [FAIL]"));
 })();
 
-/* ================= 4. 场景与四游戏渲染冒烟 ================= */
+/* ================= 4. 场景与三游戏渲染冒烟 ================= */
 (function testScenes(){
   console.log("\n=== 场景与渲染冒烟 ===");
   void ev("__frame");
@@ -225,7 +242,7 @@ console.log("脚本加载: OK   W=" + ev("W") + " H=" + ev("H"));
       console.log("  场景 " + name + ": OK");
     } catch(e){ console.log("  场景 " + name + ": 失败 -> " + e.message); }
   }
-  for(const id of ["sort", "arrow", "dash", "jump"]){
+  for(const id of ["sort", "dash", "jump"]){
     try {
       ev(`App.go("game", { id: ${JSON.stringify(id)} })`);
       ev(`for(let i=0;i<180;i++){
@@ -261,7 +278,7 @@ console.log("脚本加载: OK   W=" + ev("W") + " H=" + ev("H"));
     console.log("  存档写入: dash 最佳 = " + best + (best === 123 ? "  [OK]" : "  [FAIL]"));
   } catch(e){ console.log("  结算流程: 异常 -> " + e.message); }
   try {
-    ev('App.go("game", { id: "arrow" })');
+    ev('App.go("game", { id: "jump" })');
     ev("App.scene.end(7)");
     ev("App.scene.doShare()");
     console.log("  分享文案: OK（navigator.share 不可用时走 execCommand 兜底）");
@@ -269,3 +286,11 @@ console.log("脚本加载: OK   W=" + ev("W") + " H=" + ev("H"));
 })();
 
 console.log("\n验证结束");
+
+
+
+
+
+
+
+

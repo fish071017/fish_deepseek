@@ -62,7 +62,7 @@ let HALF = W / 2;
 const LS_KEY = "pixelArcade.v1";
 /* 构建版本：改动后请同步递增，并在 sw.js 里改 VERSION。
    用 ?debug=1 打开首页就能看到，用来确认手机拿到的不是旧缓存。 */
-const BUILD = "v4-2024-fix";
+const BUILD = "v5-三游戏版";
 
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 const lerp  = (a, b, t) => a + (b - a) * t;
@@ -372,9 +372,8 @@ document.addEventListener("contextmenu", e => e.preventDefault());
 /* ============================ 游戏注册表 ============================ */
 const GAMES = [
   { id:"sort",  name:"像素试管", en:"PIXEL SORT",  icon:"tube",  desc:"把同色方块倒进同一个瓶子",  unit:"关", color:"#ff4d6d" },
-  { id:"arrow", name:"箭头开路", en:"ARROW RUSH",  icon:"arrow", desc:"点亮箭头，让它飞出屏幕",    unit:"关", color:"#4dd2ff" },
-  { id:"dash",  name:"一指点色", en:"TAP DASH",    icon:"dash",  desc:"方块涌来，点掉同色那一条",  unit:"分", color:"#ffd93d" },
-  { id:"jump",  name:"像素跳跃", en:"JUMP STACK",  icon:"jump",  desc:"蓄力一跳，别掉下去",        unit:"层", color:"#7cffb2" }
+  { id:"dash",  name:"一指点色", en:"TAP DASH",    icon:"dash",  desc:"按颜色消除下落的方块",      unit:"分", color:"#ffd93d" },
+  { id:"jump",  name:"像素跳跃", en:"JUMP STACK",  icon:"jump",  desc:"蓄力上跳，别被岩浆追上",    unit:"层", color:"#7cffb2" }
 ];
 
 /* ============================ 场景管理 ============================ */
@@ -526,11 +525,6 @@ function drawGameIcon(kind, x, y, box, color){
     px(x + u * 1.3, y + u * 1.3, u * 1.4, u * 3.4, color);
     px(x + u * 4.4, y + u * 2, u * 2, u * 5, "#3a3a5c");
     px(x + u * 4.7, y + u * 3.4, u * 1.4, u * 3.2, "#4dd2ff");
-  } else if(kind === "arrow"){
-    px(x, y + u * 3, u * 6, u * 2, color);
-    px(x + u * 4, y + u, u * 2, u * 2, color);
-    px(x + u * 4, y + u * 5, u * 2, u * 2, color);
-    px(x + u * 6, y + u * 2.5, u * 2, u * 3, color);
   } else if(kind === "dash"){
     px(x + u * 1.5, y, u * 1.4, u * 3, color);
     px(x + u * 4, y + u * 2.5, u * 1.4, u * 3, "#4dd2ff");
@@ -760,7 +754,8 @@ Games.sort = {
   create(){
     return {
       CAP: 4,
-      states: [],          // 撤销栈
+      states: [],          // 撤销栈（完整历史）
+      redo: [],            // 重做栈
       tubes: [],           // {blocks:[color...], x,y, hover, shake}
       sel: -1,
       level: 1,
@@ -788,8 +783,14 @@ Games.sort = {
         if(lv === 1) colors = 3;
         else if(lv === 2) colors = 5;
         else colors = clamp(4 + Math.floor(lv * 0.9), 5, PALETTE.length);
-        const emp = lv <= 2 ? 1 : (lv % 4 === 0 ? 2 : 1);   // 几乎永远只有 1 根空管
-        const total = colors + emp;
+        /* 空管数量：这是手感的关键，而且和"打乱程度"是互相冲突的 ——
+           总槽位固定时，盘面越散就几乎占满所有管子，空管自然变少。
+           所以要从源头多给管子，才能在"够混"的同时留出 2 根真·空管。
+           只有 1 根空管时，玩家一旦把颜色倒散就几乎回不了头。 */
+        const baseEmp = colors >= 7 ? 3 : 2;
+        const total = colors + baseEmp + 2;   // 额外 2 根，保证打乱后仍有空管
+        const wantEmpty = baseEmp;            // 打乱后至少要剩下的空管数
+        const emp = total - colors;           // 初始空管数（比目标多，留出打乱消耗）
 
         /* 初始：按颜色堆满，前 emp 根为空 */
         let tubes = [];
@@ -797,22 +798,29 @@ Games.sort = {
         for(let i = 0; i < emp; i++) tubes.push([]);
 
         /* 反向打乱：从"已完成"状态出发做合法操作，所以正着走一定能解回去。
-           关键：每次只搬 1 块。整管搬运（n=4）永远不会打破颜色分组，
-           290 次迭代后仍是已完成状态，玩家开局就无子可下 —— 这个坑踩过。 */
-        const canPour = (from, to) => {
+           踩过两个坑，都记在这里：
+           坑一：整管搬运（一次搬 4 块）永远不会打破颜色分组，
+                 跑 290 步之后盘面依然"已完成"，玩家开局就无子可下。
+                 → 每次只搬 1 块。
+           坑二：允许"把方块倒到同色堆顶上" —— 这恰恰是撤销上一步。
+                 这类操作在候选里占多数，随机选择会反复撤销，
+                 实测跑 250 步后混色管数量为 0，颜色分组完好无损。
+                 → 打乱时禁止同色堆叠，只允许"制造混色"或"倒进空管"。
+           这两种推进操作都是合法操作的逆向（倒进空管的逆向是"整段倒回同色管"），
+           所以按本算法生成的关卡依然保证有解。 */
+        const canPourScramble = (from, to) => {
           if(from === to) return false;
           const f = tubes[from], t = tubes[to];
           if(f.length === 0) return false;
           if(t.length >= this.CAP) return false;
-          const col = f[f.length - 1];
-          if(t.length > 0 && t[t.length - 1] !== col) return false;
-          return true;
+          if(t.length === 0) return true;              /* 倒进空管：腾挪 */
+          return t[t.length - 1] !== f[f.length - 1];  /* 倒到异色顶上：制造混色 */
         };
         const scrambleOnce = () => {
-          const steps = 140 + lv * 40;
+          const steps = 160 + lv * 45;
           for(let k = 0; k < steps; k++){
             const cands = [];
-            for(let f = 0; f < total; f++) for(let t = 0; t < total; t++) if(canPour(f, t)) cands.push([f, t]);
+            for(let f = 0; f < total; f++) for(let t = 0; t < total; t++) if(canPourScramble(f, t)) cands.push([f, t]);
             if(!cands.length) break;
             const pickIdx = (Math.random() * cands.length) | 0;
             const f = cands[pickIdx][0], t = cands[pickIdx][1];
@@ -822,19 +830,58 @@ Games.sort = {
         const isTubesSolved = () => tubes.every(
           tb => tb.length === 0 || (tb.length === this.CAP && tb.every(x => x === tb[0]))
         );
-        /* 重试几次；单块搬运下很少连续撞到已完成状态 */
-        for(let attempt = 0; attempt < 12 && isTubesSolved(); attempt++) scrambleOnce();
+        /* 关卡质量的两个指标：
+           ① mixed —— 混色管数量，越多说明盘面越"散"，玩家有事可做。
+              纯色管等于已完成，玩家动不了；开局一堆纯色管就是"推不动"的观感。
+           ② empty —— 空管数量，这是操作的缓冲。空管为 0 时玩家几乎无路可走。
+           两个都要够，缺一个关卡就不好玩。 */
+        const quality = () => {
+          let mixed = 0, empty = 0, pure = 0;
+          for(const tb of tubes){
+            if(tb.length === 0){ empty++; continue; }
+            if(new Set(tb).size >= 2) mixed++;
+            else pure++;
+          }
+          return { mixed, empty, pure };
+        };
 
-        /* 兜底：万一仍然是已完成状态（小棋盘下概率不为零），
-           直接用"把整管搬到空管"的交换强制打破颜色分组。
-           这类交换同样是合法操作的反向，所以可解性不受影响。 */
-        if(isTubesSolved()){
-          const empties = [];
-          for(let i = 0; i < total; i++) if(tubes[i].length === 0) empties.push(i);
-          const src = 0;
-          const dst = empties.length ? empties[0] : (src === 0 ? 1 : 0);
-          if(tubes[dst] && tubes[dst].length < this.CAP && tubes[src].length > 0){
-            tubes[dst].push(tubes[src].pop());     /* 搬 1 块出来，颜色分组即被打破 */
+        /* 反复打乱，优先选"既够混、又留足空管"的一次。
+           空管权重给得很高：混色只是观感，空管才是玩家能不能操作的硬条件。
+           反向生成保证可解性不受影响。 */
+        let best = null, bestQ = -1;
+        for(let attempt = 0; attempt < 40; attempt++){
+          scrambleOnce();
+          if(isTubesSolved()) continue;              // 又打回去了，重来
+          const q = quality();
+          /* 空管达标是硬门槛：不达标就只在"同样不达标"里挑最好的 */
+          const score = (q.empty >= wantEmpty ? 1000 : 0) + q.empty * 40 + q.mixed;
+          if(score > bestQ){
+            best = { q, snapshot: tubes.map(t => t.slice()) };
+            bestQ = score;
+          }
+          if(q.empty >= wantEmpty + 1 && q.mixed >= Math.max(3, Math.floor(colors * 0.7))) break;
+        }
+        if(best) tubes = best.snapshot;
+
+        /* 兜底：空管不够就人为腾出几根（把整管倒进别的空管是合法操作的逆向） */
+        {
+          let q = quality();
+          let guard = 0;
+          while(q.empty < wantEmpty && guard++ < 8){
+            /* 找一根"非空且不是唯一同色"的管，整管搬到另一根空管 */
+            const empties = [];
+            for(let i = 0; i < total; i++) if(tubes[i].length === 0) empties.push(i);
+            if(!empties.length) break;
+            const dst = empties[0];
+            /* 从最长的那根管搬 1 块进空管 */
+            let src = -1, maxLen = 0;
+            for(let i = 0; i < total; i++){
+              if(i === dst) continue;
+              if(tubes[i].length > maxLen){ maxLen = tubes[i].length; src = i; }
+            }
+            if(src < 0 || maxLen === 0) break;
+            tubes[dst].push(tubes[src].pop());
+            q = quality();
           }
         }
 
@@ -842,6 +889,7 @@ Games.sort = {
         this.layout();
         this.sel = -1;
         this.states = [];
+        this.redo = [];
         this.pouring = null;
         this.moves = this.movesForColors(colors);
       },
@@ -886,16 +934,27 @@ Games.sort = {
         return tb.blocks.length === this.CAP && tb.blocks.every(b => b === tb.blocks[0]);
       },
       isSolved(){ return this.tubes.every(tb => tb.blocks.length === 0 || this.isDone(tb)); },
+      /* 完整历史：走进死局必须能退回来。
+         之前只留 1 步，"折磨优先"变成了"卡死无解"，玩家只能重开。 */
       snapshot(){
         this.states.push(this.tubes.map(tb => tb.blocks.slice()));
-        /* 只保留 1 步撤销：折磨优先 */
-        while(this.states.length > 1) this.states.shift();
+        if(this.states.length > 60) this.states.shift();
+        this.redo = [];
       },
+      snapshotString(){ return JSON.stringify(this.tubes.map(tb => tb.blocks)); },
       undo(){
         if(!this.states.length){ this.say("没有可撤销的步数了"); return; }
+        this.redo.push(this.snapshotString());     // 记下当前状态以便重做
         const s = this.states.pop();
         this.tubes.forEach((tb, i) => { tb.blocks = s[i].slice(); tb.shakeT = 0.12; });
-        this.sel = -1; Sfx.place(); Fx.addShake(3);
+        this.sel = -1; Sfx.place(); Fx.addShake(3); buzz(10);
+      },
+      redoStep(){
+        if(!this.redo || !this.redo.length){ this.say("没有可重做的步数了"); return; }
+        const s = JSON.parse(this.redo.pop());
+        this.states.push(this.tubes.map(tb => tb.blocks.slice()));
+        this.tubes.forEach((tb, i) => { tb.blocks = s[i].slice(); tb.shakeT = 0.12; });
+        this.sel = -1; Sfx.place(); Fx.addShake(3); buzz(10);
       },
       say(m){ this.msg = m; this.msgT = 1.6; },
 
@@ -945,11 +1004,10 @@ Games.sort = {
           return;
         }
         for(const tp of Input.taps){
-          /* 撤销按钮 */
-          const ur = this.undoRect;
-          if(ur && tp.x >= ur.x && tp.x <= ur.x + ur.w && tp.y >= ur.y && tp.y <= ur.y + ur.h){
-            this.undo(); continue;
-          }
+          /* 撤销 / 重做按钮 */
+          const hitBtn = (r) => r && tp.x >= r.x && tp.x <= r.x + r.w && tp.y >= r.y && tp.y <= r.y + r.h;
+          if(hitBtn(this.undoRect)){ this.undo(); continue; }
+          if(hitBtn(this.redoRect)){ this.redoStep(); continue; }
           /* 命中试管 */
           let hit = -1;
           for(let i = 0; i < this.tubes.length; i++){
@@ -1037,14 +1095,24 @@ Games.sort = {
           }
         });
 
-        /* 撤销按钮 */
-        this.undoRect = { x: W / 2 - 46, y: H - 92, w: 92, h: 38 };
+        /* 撤销 / 重做：完整历史，走进死局随时能退回来 */
+        const bw2 = (W - 80 - 12) / 2;
+        const by2 = H - 92;
+        this.undoRect = { x: 40, y: by2, w: bw2, h: 38 };
+        this.redoRect = { x: 40 + bw2 + 12, y: by2, w: bw2, h: 38 };
         const canUndo = this.states.length > 0;
+        const canRedo = this.redo && this.redo.length > 0;
         panel(this.undoRect.x, this.undoRect.y, this.undoRect.w, this.undoRect.h,
               canUndo ? "#20203a" : "#161620", canUndo ? "#9a9ab4" : "#2a2a3a", 2);
-        text("↶ 撤销 (" + this.states.length + ")", this.undoRect.x + this.undoRect.w / 2, this.undoRect.y + 20, 13,
+        text("↶ 撤销" + (canUndo ? " " + this.states.length : ""),
+             this.undoRect.x + this.undoRect.w / 2, this.undoRect.y + 20, 13,
              canUndo ? "#e8e8f0" : "#4a4a60", "center");
-        text("每关只能撤销 1 步", HALF, H - 42, 10, "#5a5a76", "center");
+        panel(this.redoRect.x, this.redoRect.y, this.redoRect.w, this.redoRect.h,
+              canRedo ? "#20203a" : "#161620", canRedo ? "#9a9ab4" : "#2a2a3a", 2);
+        text("重做 ↷" + (canRedo ? " " + this.redo.length : ""),
+             this.redoRect.x + this.redoRect.w / 2, this.redoRect.y + 20, 13,
+             canRedo ? "#e8e8f0" : "#4a4a60", "center");
+        text("颜色对不上就撤销，不会卡死", HALF, H - 42, 10, "#5a5a76", "center");
 
         /* 提示语 */
         if(this.msgT > 0 && this.msg){
@@ -1090,321 +1158,6 @@ Games.sort = {
 };
 
 /* ======================================================================
-   游戏 G：箭头开路 ARROW RUSH
-   规则：箭头朝哪个方向，就要求那条路到边缘完全通畅才能起飞。
-        点掉通畅的箭头，它飞出屏幕并让别的箭头"解锁"。
-        清空整盘过关。被挡住的箭头点不动。
-   难度：折磨优先。4x4 起手，一路长到 8x8（近 50 个箭头）；
-        每关限时，连快点出连击倍率，时间耗尽即结束。
-   关卡由"反向放置"生成：每个箭头落位时其路径必然通畅，
-        因此按落位逆序清空一定能通关 —— 保证有解，绝不死局。
-   ====================================================================== */
-Games.arrow = {
-  create(){
-    return {
-      COLS: 0, ROWS: 0, CELL: 0, ox: 0, oy: 0,
-      grid: [],
-      flying: [],
-      level: 1,
-      timeLeft: 0, timeMax: 0,
-      arrowsLeft: 0, arrowsTotal: 0,
-      combo: 0, comboT: 0, bestChain: 0,
-      clearT: 0,
-      solvedCount: 0,
-      blockMsgT: 0, blockAt: null,
-      lastClear: null,
-      t: 0,
-
-      init(app){
-        this.app = app;
-        this.level = this.level || 1;
-        this.solvedCount = 0;
-        this.t = 0;
-        this.buildLevel();
-      },
-      advance(){
-        this.level++;
-        this.solvedCount++;
-        this.buildLevel();
-        return this.level;
-      },
-
-      /* ---------- 关卡生成（反向放置，保证有解） ---------- */
-      buildLevel(){
-        const lv = this.level;
-        const DIRS = [[1,0],[-1,0],[0,1],[0,-1]];
-        /* 尺寸曲线：4 → 8，第 8 关起封顶 */
-        const size = lv <= 1 ? 4 : lv <= 3 ? 5 : lv <= 5 ? 6 : lv <= 7 ? 7 : 8;
-        this.COLS = size; this.ROWS = size;
-        this.CELL = Math.floor(Math.min((W - 40) / size, 400 / size));
-        this.ox = Math.floor((W - size * this.CELL) / 2);
-        /* 纵向居中于顶栏与底部提示之间 */
-        this.oy = Math.max(Y(132), Math.round((H - size * this.CELL) * 0.46));
-
-        const need = Math.floor(size * size * (lv <= 1 ? 0.72 : 0.82));
-        const cells = [];
-        for(let r = 0; r < size; r++) for(let c = 0; c < size; c++) cells.push([c, r]);
-        for(let i = cells.length - 1; i > 0; i--){ const j = (Math.random() * (i + 1)) | 0; [cells[i], cells[j]] = [cells[j], cells[i]]; }
-
-        const grid = Array.from({ length: size }, () => new Array(size).fill(null));
-        const pathClear = (c, r, dx, dy) => {
-          let x = c + dx, y = r + dy;
-          while(x >= 0 && x < size && y >= 0 && y < size){
-            if(grid[y][x]) return false;
-            x += dx; y += dy;
-          }
-          return true;
-        };
-        let placed = 0, cursor = 0, guard = 0;
-        while(placed < need && guard++ < 9000){
-          const [c, r] = cells[cursor % cells.length];
-          cursor++;
-          if(grid[r][c]) continue;
-          const opts = DIRS.filter(([dx, dy]) => pathClear(c, r, dx, dy));
-          if(!opts.length) continue;
-          const [dx, dy] = pick(opts);
-          grid[r][c] = {
-            /* spawn 直接置 1：入场动画会让箭头在最初 ~0.4s 内尺寸为 0，
-               手机上加载偏慢时很容易看到"空盘面"，以为没有箭头。 */
-            dx, dy, alive: true, spawn: 1, blockT: 0,
-            color: dx === 1 ? 0 : dx === -1 ? 1 : dy === 1 ? 2 : 3
-          };
-          placed++;
-        }
-
-        this.grid = grid;
-        this.arrowsLeft = placed;
-        this.arrowsTotal = placed;
-        /* 限时：约每个箭头 1.05 秒起，越往后越紧（折磨曲线） */
-        const per = clamp(1.30 - lv * 0.045, 0.72, 1.30);
-        this.timeMax = placed * per;
-        this.timeLeft = this.timeMax;
-        this.flying = [];
-        this.clearT = 0;
-        this.combo = 0; this.comboT = 0; this.bestChain = 0;
-        this.blockMsgT = 0; this.blockAt = null;
-        this.lastClear = null;
-      },
-
-      colorOf(k){ return ["#4dd2ff", "#ff6ec7", "#ffd93d", "#7cffb2"][k % 4]; },
-
-      /* ---------- 判定 ---------- */
-      firstBlocker(c, r, dx, dy){
-        let x = c + dx, y = r + dy;
-        while(x >= 0 && x < this.COLS && y >= 0 && y < this.ROWS){
-          const g = this.grid[y][x];
-          if(g && g.alive) return [x, y];
-          x += dx; y += dy;
-        }
-        return null;
-      },
-      isFree(c, r){
-        const g = this.grid[r][c];
-        if(!g || !g.alive) return false;
-        return !this.firstBlocker(c, r, g.dx, g.dy);
-      },
-      freeCount(){
-        let n = 0;
-        for(let r = 0; r < this.ROWS; r++) for(let c = 0; c < this.COLS; c++) if(this.isFree(c, r)) n++;
-        return n;
-      },
-
-      /* ---------- 主循环 ---------- */
-      update(dt, app){
-        this.app = app;
-        this.t += dt;
-        if(this.comboT > 0){ this.comboT -= dt; if(this.comboT <= 0) this.combo = 0; }
-        if(this.blockMsgT > 0) this.blockMsgT -= dt;
-
-        /* 每帧只算一次"可点箭头"，绘制与判定共用（8x8 时不重复做 64 次射线扫描） */
-        this.freeMap = [];
-        for(let r = 0; r < this.ROWS; r++){
-          this.freeMap[r] = [];
-          for(let c = 0; c < this.COLS; c++) this.freeMap[r][c] = this.isFree(c, r);
-        }
-
-        /* 生成动画与抖动 */
-        for(let r = 0; r < this.ROWS; r++) for(let c = 0; c < this.COLS; c++){
-          const g = this.grid[r][c];
-          if(!g) continue;
-          if(g.spawn < 1) g.spawn = Math.min(1, g.spawn + dt * 2.6);
-          if(g.blockT > 0) g.blockT -= dt;
-        }
-        /* 飞出动画 */
-        for(let i = this.flying.length - 1; i >= 0; i--){
-          const f = this.flying[i];
-          f.t += dt;
-          if(f.t > 1.5){ this.flying.splice(i, 1); continue; }
-          f.cx = f.x + f.dx * 780 * f.t;
-          f.cy = f.y + f.dy * 780 * f.t;
-        }
-        /* 过关动画 */
-        if(this.clearT > 0){
-          this.clearT -= dt;
-          if(this.clearT <= 0) app.win(this.solvedCount + 1, "第 " + this.level + " 关已破");
-          return;              /* 过关动画期间冻结计时，避免"刚清完就判负" */
-        }
-        /* 计时 */
-        this.timeLeft -= dt;
-        if(this.timeLeft <= 0){
-          this.timeLeft = 0;
-          app.end(this.solvedCount);
-          return;
-        }
-        /* 输入 */
-        for(const tp of Input.taps){
-          const cell = this.cellAt(tp.x, tp.y);
-          if(!cell) continue;
-          this.tryFire(cell[0], cell[1], app);
-        }
-      },
-      cellAt(x, y){
-        const c = Math.floor((x - this.ox) / this.CELL);
-        const r = Math.floor((y - this.oy) / this.CELL);
-        if(c < 0 || c >= this.COLS || r < 0 || r >= this.ROWS) return null;
-        return [c, r];
-      },
-      tryFire(c, r, app){
-        const g = this.grid[r][c];
-        if(!g || !g.alive) return;
-        if(!this.isFree(c, r)){
-          /* 被挡住：点不动，抖一下并高亮挡路者 */
-          g.blockT = 0.36;
-          const bl = this.firstBlocker(c, r, g.dx, g.dy);
-          this.blockAt = bl ? [this.ox + bl[0] * this.CELL + this.CELL / 2, this.oy + bl[1] * this.CELL + this.CELL / 2] : null;
-          this.blockMsgT = 0.7;
-          this.combo = 0;
-          Sfx.fail(); Fx.addShake(4); buzz(18);
-          return;
-        }
-        /* 成功：一次只消一个 */
-        g.alive = false;
-        this.arrowsLeft--;
-        this.combo++;
-        this.comboT = 0.85;
-        this.bestChain = Math.max(this.bestChain, this.combo);
-        const col = this.colorOf(g.color);
-        const cx = this.ox + c * this.CELL + this.CELL / 2;
-        const cy = this.oy + r * this.CELL + this.CELL / 2;
-        this.flying.push({ x: cx, y: cy, dx: g.dx, dy: g.dy, color: col, t: 0, cx, cy });
-        Fx.burst(cx, cy, 7, col, 165);
-        if(this.combo >= 3){ Sfx.combo(this.combo); Fx.addShake(3 + Math.min(this.combo, 8)); }
-        else Sfx.good();
-        buzz(7);
-
-        /* 过关 */
-        if(this.arrowsLeft <= 0){
-          this.clearT = 0.45;
-          Sfx.win(); Fx.flash("#ffffff", 0.28); Fx.addShake(9);
-          const bonus = Math.max(0, this.timeLeft);
-          this.lastClear = { bonus };
-        }
-      },
-
-      hud(){
-        return "第 " + this.level + " 关 · 剩 " + this.arrowsLeft + "/" + this.arrowsTotal;
-      },
-
-      /* ---------- 绘制 ---------- */
-      draw(){
-        /* 盘面 */
-        const gw = this.COLS * this.CELL, gh = this.ROWS * this.CELL;
-        px(this.ox - 5, this.oy - 5, gw + 10, gh + 10, "#16162a");
-        for(let r = 0; r < this.ROWS; r++) for(let c = 0; c < this.COLS; c++){
-          const bx = this.ox + c * this.CELL, by = this.oy + r * this.CELL;
-          px(bx + 2, by + 2, this.CELL - 4, this.CELL - 4, (r + c) % 2 ? "#141426" : "#181830");
-        }
-
-        /* 时间条 + 进度条：紧贴顶栏下方 */
-        const barY = boardTop();
-        const tr = clamp(this.timeLeft / Math.max(0.001, this.timeMax), 0, 1);
-        const low = tr < 0.28;
-        px(40, barY, W - 80, 7, "#25253a");
-        px(40, barY, (W - 80) * tr, 7, low ? (Math.sin(this.t * 12) > 0 ? "#ff4d6d" : "#7a2a3a") : "#4dd2ff");
-        const ar = 1 - this.arrowsLeft / Math.max(1, this.arrowsTotal);
-        px(40, barY + 11, W - 80, 3, "#1a1a2e");
-        px(40, barY + 11, (W - 80) * ar, 3, "#7cffb2");
-        text(Math.ceil(this.timeLeft) + "s", 10, barY + 4, 11, low ? "#ff4d6d" : "#7a7a94", "left");
-        if(low && Math.sin(this.t * 12) > 0) text("时间告急", W - 10, barY + 4, 11, "#ff4d6d", "right");
-
-        /* 箭头 */
-        for(let r = 0; r < this.ROWS; r++) for(let c = 0; c < this.COLS; c++){
-          const g = this.grid[r][c];
-          if(!g || !g.alive) continue;
-          const cx = this.ox + c * this.CELL + this.CELL / 2;
-          const cy = this.oy + r * this.CELL + this.CELL / 2;
-          const s = easeOut(g.spawn) * (this.CELL * 0.6);
-          const free = this.freeMap[r] ? this.freeMap[r][c] : this.isFree(c, r);
-          const shaking = g.blockT > 0;
-          const sx = shaking ? rand(-4, 4) : 0;
-          /* 可点的箭头必须一眼可读：底色提亮 + 亮边框 + 呼吸 */
-          if(free && !shaking){
-            const pulse = 0.5 + 0.5 * Math.sin(this.t * 5 + (c + r) * 0.7);
-            const inset = this.CELL * 0.44;
-            ctx.globalAlpha = 0.20 + 0.26 * pulse;
-            px(cx - inset, cy - inset, inset * 2, inset * 2, "#ffffff");
-            ctx.globalAlpha = 0.55 + 0.45 * pulse;
-            ctx.strokeStyle = "#ffffff";
-            ctx.lineWidth = 2;
-            ctx.strokeRect(Math.round(cx - inset), Math.round(cy - inset), Math.round(inset * 2), Math.round(inset * 2));
-            ctx.globalAlpha = 1;
-          }
-          this.drawArrow(cx + sx, cy, s, g.dx, g.dy, shaking ? "#ff4d6d" : this.colorOf(g.color));
-        }
-        /* 飞出的箭头 */
-        for(const f of this.flying){
-          ctx.globalAlpha = clamp(1.5 - f.t, 0, 1);
-          this.drawArrow(f.cx, f.cy, this.CELL * 0.58, f.dx, f.dy, f.color);
-          ctx.globalAlpha = 1;
-        }
-        /* 被挡提示 */
-        if(this.blockMsgT > 0){
-          ctx.globalAlpha = clamp(this.blockMsgT / 0.35, 0, 1);
-          text("这条路被挡住了", HALF, Y(148), 15, "#ff4d6d", "center", "#400");
-          if(this.blockAt){
-            const s = 9 + (1 - this.blockMsgT / 0.7) * 11;
-            ctx.strokeStyle = "#ff4d6d"; ctx.lineWidth = 2;
-            ctx.strokeRect(this.blockAt[0] - s, this.blockAt[1] - s, s * 2, s * 2);
-          }
-          ctx.globalAlpha = 1;
-        }
-        /* 连击 */
-        if(this.comboT > 0 && this.combo >= 2){
-          const a = clamp(this.comboT / 0.6, 0, 1);
-          ctx.globalAlpha = a;
-          const mult = Math.min(this.combo, 9);
-          text(this.combo + " 连击  ×" + mult, HALF, Y(148), 17, "#ffd93d", "center", "#7a5c00");
-          ctx.globalAlpha = 1;
-        }
-        text("点亮路径通畅的箭头 · 一次消一个", HALF, H - 40, 11, "#5a5a76", "center");
-
-        if(this.clearT > 0){
-          ctx.globalAlpha = clamp(1 - this.clearT / 0.45, 0, 1) * 0.7;
-          ctx.fillStyle = "#4dd2ff"; ctx.fillRect(0, 0, W, H);
-          ctx.globalAlpha = 1;
-          text("过 关 !", HALF, H / 2, 44, "#0b0b14", "center");
-        }
-      },
-      /* 像素三角箭头 */
-      drawArrow(cx, cy, s, dx, dy, color){
-        const n = 5, half = s / 2;
-        ctx.fillStyle = color;
-        for(let i = 0; i < n; i++){
-          const t = i / (n - 1);
-          const w = half * (1 - t);
-          if(dx === 1) ctx.fillRect(Math.round(cx - half + t * s), Math.round(cy - w), Math.ceil(s / n) + 1, Math.max(2, w * 2));
-          else if(dx === -1) ctx.fillRect(Math.round(cx + half - t * s - s / n), Math.round(cy - w), Math.ceil(s / n) + 1, Math.max(2, w * 2));
-          else if(dy === 1) ctx.fillRect(Math.round(cx - w), Math.round(cy - half + t * s), Math.max(2, w * 2), Math.ceil(s / n) + 1);
-          else ctx.fillRect(Math.round(cx - w), Math.round(cy + half - t * s - s / n), Math.max(2, w * 2), Math.ceil(s / n) + 1);
-        }
-        ctx.fillStyle = "rgba(255,255,255,.45)";
-        if(dx !== 0) ctx.fillRect(Math.round(cx - half), Math.round(cy - 1), Math.round(s * 0.5), 2);
-        else ctx.fillRect(Math.round(cx - 1), Math.round(cy - half), 2, Math.round(s * 0.5));
-      }
-    };
-  }
-};
-/* ======================================================================
    游戏 H：一指点色 TAP DASH
    规则：四种颜色的方块从上方落下。判定线下方有一排颜色按钮，
         点某个颜色按钮 → 消除当前所有轨道里"最下面一个该颜色的方块"。
@@ -1432,6 +1185,7 @@ Games.dash = {
       lastColor: -1,
       dead: false,
       t: 0,
+      spawnPaused: false,   // 调试/测试用：冻结新方块生成
       init(app){
         this.app = app;
         this.LANES = 4;
@@ -1463,7 +1217,7 @@ Games.dash = {
         this.spawnT -= dt;
 
         const spawnGap = Math.max(0.18, 0.80 - this.elapsed * 0.016);
-        if(this.spawnT <= 0){
+        if(this.spawnT <= 0 && !this.spawnPaused){
           this.spawnT = spawnGap * rand(0.82, 1.18);
           this.spawnBlock();
         }
@@ -1626,9 +1380,10 @@ Games.dash = {
 
 /* ======================================================================
    游戏 I：像素跳跃 JUMP STACK
-   规则：长按蓄力，松手起跳。落在平台上得分，落在正中间额外奖励。
-        掉下去即结束。
-   难度：折磨优先。平台越来越窄、还会左右移动。
+   规则：长按蓄力、松手起跳。跳跃会自动朝"下一个平台"横向吸附，
+        所以玩家只需要管一件事：蓄够力、别被下方的岩浆追上。
+        岩浆持续上升，玩家碰到屏幕底部即死。
+        落在平台正中间额外奖励。
    ====================================================================== */
 Games.jump = {
   create(){
@@ -1637,32 +1392,41 @@ Games.jump = {
       player: { x: 0, y: 0, vx: 0, vy: 0, onGround: true, squash: 0 },
       charge: 0, charging: false,
       camY: 0,
-      targetCamY: 0,
+      hazardY: 0,          // 岩浆的世界坐标 y（随时间上升 = 数值减小）
+      hazardSpeed: 0,
       score: 0, combo: 0,
-      /* 物理参数：用"目标跳跃高度"反推初速度，而不是随手给一个初速度。
-         v = sqrt(2 * g * h)。之前是 v = MAXJUMP*0.62*(...)-120，满蓄力只上升 31px，
-         而平台间距 74px —— 玩家永远跳不上去，必现死局。 */
+      /* 物理参数：由"目标跳跃高度"反推初速度 v = sqrt(2*g*h) */
       GRAV: 1700,
-      MIN_JUMP_H: 62,        // 短按的跳跃高度
-      MAX_JUMP_H: 150,       // 满蓄力的跳跃高度（> 平台最大间距）
-      MAX_GAP: 120,          // 平台间距上限，必须明显小于满蓄力高度
-      AIR_CTRL: 18,          // 起跳时的水平微调幅度
+      MIN_JUMP_H: 62,
+      MAX_JUMP_H: 150,
+      MAX_GAP: 112,        // 平台间距上限，必须明显小于满蓄力高度
+      SNAP_ACC: 900,       // 自动吸附的水平加速度（px/s²）
+      SNAP_MAX_V: 230,     // 自动吸附的水平速度上限
+      HAZARD_START: 46,    // 岩浆初始上升速度 px/s
       over: false,
+      t: 0,
+      aimTarget: null,     // 起跳瞬间锁定的吸附目标
+      sayCharge: 0,        // "蓄力不够"提示计时
       init(app){
         this.app = app;
         this.plats = [];
         this.baseW = 96;
         this.perfectMsg = { t: 0, text: "" };
-        const start = { x: W / 2 - 48, y: H - 170, w: 96, h: 16, mw: 0, vx: 0 };
-        this.plats.push(start);
-        this.player.x = W / 2; this.player.y = start.y;
+        const startPlat = { x: W / 2 - 48, y: H - 210, w: 96, h: 16, mw: 0, vx: 0 };
+        this.plats.push(startPlat);
+        this.player.x = W / 2; this.player.y = startPlat.y;
         this.player.vx = 0; this.player.vy = 0;
         this.player.onGround = true;
-        this.camY = 0; this.targetCamY = 0;
+        this.camY = 0;
         this.score = 0; this.combo = 0; this.over = false;
-        this.spawnNext();
+        this.t = 0;
+        this.perfectMsg = { t: 0, text: "" };
+        /* 岩浆从屏幕底部下方一点开始 */
+        this.hazardY = this.camY + H + 30;
+        this.hazardSpeed = this.HAZARD_START;
+        /* 预铺几个平台 */
+        for(let i = 0; i < 5; i++) this.spawnNext();
       },
-      /* 按蓄力比例算出跳跃初速度（负值 = 向上） */
       jumpVelocity(charge){
         const h = lerp(this.MIN_JUMP_H, this.MAX_JUMP_H, clamp(charge, 0, 1));
         return -Math.sqrt(2 * this.GRAV * h);
@@ -1670,23 +1434,57 @@ Games.jump = {
       spawnNext(){
         const last = this.plats[this.plats.length - 1];
         const lv = this.plats.length;
-        const w = clamp(this.baseW - lv * 1.6, 26, 96);
-        /* 间距必须留出余量：满蓄力高度 150，间距最多 120 */
-        const gap = clamp(74 + lv * 3.0, 74, this.MAX_GAP);
-        const nx = clamp(last.x + last.w / 2 + rand(-90, 90) - w / 2, 20, W - w - 20);
-        const ny = last.y - gap;
-        const moving = lv > 6 && Math.random() < clamp(0.15 + lv * 0.03, 0, 0.6);
+        const w = clamp(this.baseW - lv * 1.4, 30, 96);
+        const prevCx = last.x + last.w / 2;
+        /* 先按随机横向偏移定新中心，再据此确定纵向间距。
+           间距必须 <= 满蓄力高度 * 0.82，否则会出现跳不上去的死局。 */
+        const dxMax = clamp(96 - lv * 1.5, 46, 96);
+        const dx = rand(-dxMax, dxMax);
+        let cx = clamp(prevCx + dx, 20 + w / 2, W - 20 - w / 2);
+        const horiz = Math.abs(cx - prevCx);
+        /* 水平越远，纵向就得越近，保证这一跳够得着 */
+        const gapMax = clamp(this.MAX_GAP - horiz * 0.18, 62, this.MAX_GAP);
+        const gap = clamp(rand(0.72, 1.0) * gapMax, 58, gapMax);
+        const moving = lv > 5 && Math.random() < clamp(0.12 + lv * 0.03, 0, 0.55);
         this.plats.push({
-          x: nx, y: ny, w, h: 16, mw: nx,
-          vx: moving ? (Math.random() < 0.5 ? -1 : 1) * rand(26, 26 + lv * 3) : 0,
-          range: moving ? rand(24, 60) : 0
+          x: cx - w / 2, y: last.y - gap, w, h: 16, mw: cx - w / 2,
+          vx: moving ? (Math.random() < 0.5 ? -1 : 1) * rand(24, 24 + lv * 2.5) : 0,
+          range: moving ? rand(20, 52) : 0
         });
       },
+      /* 找玩家上方、且够得着的最近平台（自动吸附的目标）。
+         只在起跳瞬间调用一次，然后锁定 —— 如果每帧重算，
+         玩家上升越过目标后目标会突然切换，横向速度反向，容易把人甩飞。 */
+      aimPlatform(){
+        const p = this.player;
+        const reach = (this.MAX_JUMP_H * 0.95) - 10;   // 稍留余量
+        let best = null;
+        for(const pl of this.plats){
+          if(pl.y >= p.y - 2) continue;                // 必须在玩家上方
+          if(p.y - pl.y > reach) continue;             // 够不着的不算
+          if(!best || pl.y > best.y) best = pl;        // 取最近（y 最大）的
+        }
+        /* 一个都够不着就退回"最高的那个"，总比没有目标好 */
+        if(!best){
+          for(const pl of this.plats){
+            if(pl.y >= p.y - 2) continue;
+            if(!best || pl.y > best.y) best = pl;
+          }
+        }
+        return best;
+      },
+      /* 兼容旧命名 */
+      nextPlatformAbove(){ return this.aimTarget || this.aimPlatform(); },
       update(dt, app){
         if(this.over) return;
-        this.t = (this.t || 0) + dt;
+        this.t += dt;
         if(this.perfectMsg.t > 0) this.perfectMsg.t -= dt;
         const p = this.player;
+
+        /* 岩浆越升越快，但给一个上限，否则后期必然瞬死 */
+        this.hazardSpeed = Math.min(46 + this.t * 1.15, 120);
+        this.hazardY -= this.hazardSpeed * dt;
+
         /* 蓄力 */
         if(Input.down){
           this.charging = true;
@@ -1696,144 +1494,201 @@ Games.jump = {
         if(Input.released && this.charging){
           this.charging = false;
           if(p.onGround){
-            p.vy = this.jumpVelocity(this.charge);
-            /* 滞空时间固定，左右微调幅度不随蓄力变化，避免空中失控 */
-            p.vx = rand(-this.AIR_CTRL, this.AIR_CTRL);
+            const h = lerp(this.MIN_JUMP_H, this.MAX_JUMP_H, clamp(this.charge, 0, 1));
+            p.vy = -Math.sqrt(2 * this.GRAV * h);
             p.onGround = false;
+            /* 起跳瞬间锁定吸附目标，整个滞空期间不再改 */
+            this.aimTarget = this.aimPlatform();
+            p.vx = 0;
             Sfx.good(); buzz(12);
             Fx.addShake(3 + this.charge * 5);
-            const pc = this.plats.find(pl => p.y >= pl.y - 2 && p.y <= pl.y + pl.h + 8 && p.x >= pl.x && p.x <= pl.x + pl.w);
-            if(pc) Fx.burst(p.x, pc.y, 8, "#7cffb2", 130);
+            const here = this.plats.find(pl => p.x >= pl.x && p.x <= pl.x + pl.w && Math.abs(p.y - pl.y) < 6);
+            if(here) Fx.burst(p.x, here.y - this.camY, 8, "#7cffb2", 130);
+            /* 蓄力不够够不到目标时给个提示 */
+            if(this.aimTarget && (p.y - this.aimTarget.y) > h * 0.95){
+              this.sayCharge = 0.9;
+            }
           }
           this.charge = 0; p.squash = 0;
         }
+        if(this.sayCharge > 0) this.sayCharge -= dt;
+
         /* 移动平台 */
-        if(!p.onGround){
-          for(const pl of this.plats){
-            if(pl.vx){ pl.mw += pl.vx * dt; pl.x += pl.vx * dt; }
-          }
-          for(const pl of this.plats){
-            if(pl.range && (pl.x < pl.mw - pl.range || pl.x > pl.mw + pl.range)){ pl.vx *= -1; }
+        for(const pl of this.plats){
+          if(pl.vx){
+            pl.mw += pl.vx * dt; pl.x += pl.vx * dt;
+            if(pl.range && (pl.x < pl.mw - pl.range || pl.x > pl.mw + pl.range)) pl.vx *= -1;
           }
         }
+
         if(!p.onGround){
+          /* ---- 横向自动吸附：朝起跳时锁定的目标平台中心加速 ---- */
+          const tgt = this.aimTarget;
+          if(tgt){
+            const tcx = tgt.x + tgt.w / 2;
+            const dir = Math.sign(tcx - p.x);
+            p.vx += dir * this.SNAP_ACC * dt;
+            p.vx = clamp(p.vx, -this.SNAP_MAX_V, this.SNAP_MAX_V);
+          } else {
+            p.vx *= Math.pow(0.02, dt);           // 没有目标就慢慢停住
+          }
           p.vy += this.GRAV * dt;
           p.x += p.vx * dt;
           p.y += p.vy * dt;
-          /* 撞墙 */
-          if(p.x < 8){ p.x = 8; p.vx = Math.abs(p.vx) * 0.4; }
-          if(p.x > W - 8){ p.x = W - 8; p.vx = -Math.abs(p.vx) * 0.4; }
+          if(p.x < 10){ p.x = 10; p.vx = 0; }
+          if(p.x > W - 10){ p.x = W - 10; p.vx = 0; }
           /* 落地检测（只在下落时） */
           if(p.vy > 0){
             for(const pl of this.plats){
-              if(p.y >= pl.y && p.y <= pl.y + pl.h + Math.abs(p.vy) * dt + 6 &&
-                 p.x >= pl.x - 6 && p.x <= pl.x + pl.w + 6){
+              if(p.y >= pl.y && p.y <= pl.y + pl.h + Math.abs(p.vy) * dt + 8 &&
+                 p.x >= pl.x - 4 && p.x <= pl.x + pl.w + 4){
                 this.land(pl, app);
                 break;
               }
             }
           }
-          /* 掉出屏幕 */
-          if(p.y > this.camY + H + 60){
-            this.over = true;
-            Fx.addShake(16); Sfx.fail(); buzz([40, 50, 80]);
-            app.end(this.score);
-            return;
-          }
+        } else {
+          p.vx = 0;
         }
-        /* 相机跟随：玩家始终在屏幕下方 1/3 附近 */
-        this.targetCamY = Math.min(this.camY, p.y - (H * 0.66));
-        this.camY = lerp(this.camY, this.targetCamY, clamp(dt * 7, 0, 1));
-        /* 补平台 */
-        while(this.plats[this.plats.length - 1].y > this.camY - 60) this.spawnNext();
-        /* 清理在屏幕下方的旧平台 */
-        while(this.plats.length > 3 && this.plats[0].y > this.camY + H + 200) this.plats.shift();
+
+        /* ---- 相机持续上升（只上不下） ---- */
+        const targetCam = p.y - H * 0.70;
+        if(targetCam < this.camY) this.camY = lerp(this.camY, targetCam, clamp(dt * 6, 0, 1));
+
+        /* ---- 岩浆触碰屏幕底部 = 死 ---- */
+        const bottomLine = this.camY + H;
+        if(p.y >= bottomLine - 6){
+          this.over = true;
+          Fx.addShake(20); Sfx.fail(); buzz([50, 60, 100]);
+          Fx.flash("#ff4d6d", 0.35);
+          Fx.burst(p.x, bottomLine - this.camY, 24, "#ff4d6d", 260);
+          app.end(this.score);
+          return;
+        }
+        /* 平台被岩浆淹没：踩上去也活不了，直接删除 */
+        while(this.plats.length > 1 && this.plats[0].y > this.hazardY + 40) this.plats.shift();
+
+        /* 补平台，保证前方一直有目标 */
+        while(this.plats[this.plats.length - 1].y > this.camY - 80) this.spawnNext();
       },
       land(pl, app){
         const p = this.player;
         p.y = pl.y; p.vy = 0; p.vx = 0; p.onGround = true;
+        this.aimTarget = null;          // 落地后解除目标锁定
         const center = pl.x + pl.w / 2;
         const off = Math.abs(p.x - center);
         const perfect = off < 9;
-        /* 计分：越高越值钱，正中心翻倍 */
-        const idx = this.plats.indexOf(pl);
-        const base = 10 + Math.max(0, idx) * 2;
+        const idx = Math.max(0, this.plats.indexOf(pl));
+        const base = 10 + idx * 2;
+        /* 粒子用屏幕坐标：Fx 在相机平移之外绘制 */
+        const screenY = pl.y - this.camY;
         if(perfect){
           this.combo++;
           this.score += base * 2 * Math.min(this.combo, 5);
           Sfx.perfect(); Fx.flash("#ffd93d", 0.14); Fx.addShake(7); buzz([10, 20]);
-          Fx.burst(center, pl.y, 20, "#ffd93d", 240);
+          Fx.burst(center, screenY, 20, "#ffd93d", 240);
         } else {
           this.combo = 0;
           this.score += base;
           Sfx.place(); Fx.addShake(3); buzz(8);
-          Fx.burst(p.x, pl.y, 8, "#7cffb2", 140);
+          Fx.burst(p.x, screenY, 8, "#7cffb2", 140);
         }
         this.perfectMsg = { t: perfect ? 0.8 : 0, text: perfect ? "PERFECT!" : "" };
-        /* 每落一次生成新平台，保持前方有目标 */
-        const lastY = this.plats[this.plats.length - 1].y;
-        if(pl.y <= lastY + 200) this.spawnNext();
       },
       hud(){ return this.score + " 层"; },
       draw(){
+        const p = this.player;
+        const bottomLine = this.camY + H;
+
         ctx.save();
         ctx.translate(0, -this.camY);
         /* 平台 */
         for(const pl of this.plats){
-          const onScreen = pl.y > this.camY - 40 && pl.y < this.camY + H + 40;
-          if(!onScreen) continue;
-          block(pl.x, pl.y, pl.w, pl.h, "#3a3a5c", "#6a6a9c", "#1a1a2e");
-          px(pl.x + 2, pl.y + 2, pl.w - 4, 3, "#7cffb2");
-          /* 中心标记 */
+          if(pl.y < this.camY - 40 || pl.y > bottomLine + 60) continue;
+          const sunk = pl.y > this.hazardY;       // 已被岩浆淹没
+          block(pl.x, pl.y, pl.w, pl.h, sunk ? "#4a2a2a" : "#3a3a5c", "#6a6a9c", "#1a1a2e");
+          px(pl.x + 2, pl.y + 2, pl.w - 4, 3, sunk ? "#ff4d6d" : "#7cffb2");
           px(pl.x + pl.w / 2 - 1, pl.y + 3, 2, 6, "#ffd93d");
         }
         /* 玩家 */
-        const p = this.player;
         const sq = p.squash;
         const pw = 22 + sq * 8, ph = 26 - sq * 10;
         const pxr = p.x - pw / 2, pyr = p.y - ph;
+        /* 吸附目标指示：给玩家一个明确的"会飞向哪"的反馈 */
+        if(!p.onGround){
+          const tgt = this.aimTarget;
+          if(tgt){
+            const tcx = tgt.x + tgt.w / 2;
+            ctx.globalAlpha = 0.35;
+            px(tcx - 1, tgt.y - 26, 2, 20, "#7cffb2");
+            px(tcx - 6, tgt.y - 30, 12, 3, "#7cffb2");
+            ctx.globalAlpha = 1;
+          }
+        }
+        /* 蓄力不够时的提示 */
+        if(this.sayCharge > 0 && Math.sin(this.t * 14) > -0.3){
+          ctx.globalAlpha = clamp(this.sayCharge, 0, 1);
+          text("蓄力不够！松早了", HALF, H / 2 - 100, 17, "#ff4d6d", "center", "#400");
+          ctx.globalAlpha = 1;
+        }
         /* 蓄力指示 */
         if(this.charging && p.onGround){
           const barW = 60;
           px(p.x - barW / 2, pyr - 16, barW, 5, "#25253a");
           px(p.x - barW / 2, pyr - 16, barW * this.charge, 5, this.charge > 0.85 ? "#ff4d6d" : "#7cffb2");
-          /* 用真实物理画抛物线预测 —— 让玩家看得出要蓄多少力才够到下一个平台 */
           const v0 = this.jumpVelocity(this.charge);
           ctx.globalAlpha = 0.5;
           for(let i = 1; i <= 14; i++){
-            const t = i * 0.055;
-            const yy = p.y + v0 * t + 0.5 * this.GRAV * t * t;
+            const tt = i * 0.055;
+            const yy = p.y + v0 * tt + 0.5 * this.GRAV * tt * tt;
             if(yy > p.y + 8) break;
             px(p.x - 1, yy, 3, 3, "#ffd93d");
           }
           ctx.globalAlpha = 1;
-          /* 标出这一跳的最高点，方便判断够不够 */
           const apex = p.y - (v0 * v0) / (2 * this.GRAV);
           px(p.x - 8, apex, 16, 2, "#ffd93d");
         }
         block(pxr, pyr, pw, ph, "#7cffb2", "rgba(255,255,255,.45)", "rgba(0,0,0,.4)");
-        /* 眼睛（像素） */
         px(pxr + 5, pyr + 8, 4, 5, "#0b0b14");
         px(pxr + pw - 9, pyr + 8, 4, 5, "#0b0b14");
         ctx.restore();
 
-        /* 高度计：从起始平台算起 */
-        const groundY = this.plats.length ? this.plats[0].y : H - 170;
-        const height = Math.max(0, Math.round((groundY - this.player.y) / 10));
+        /* ---- 岩浆：在相机平移之外绘制（用屏幕坐标） ---- */
+        const hz = this.hazardY - this.camY;      // 岩浆在屏幕上的 y
+        if(hz < H + 10){
+          const top = Math.max(hz, -10);
+          px(0, top, W, H - top + 20, "#8a1030");
+          /* 翻滚的岩浆表面 */
+          for(let x = 0; x < W; x += 12){
+            const wob = Math.sin(this.t * 4 + x * 0.09) * 5;
+            px(x, top + wob - 3, 12, 8, "#ff4d6d");
+          }
+          /* 上方热浪 */
+          for(let i = 0; i < 5; i++){
+            ctx.globalAlpha = 0.06 - i * 0.011;
+            px(0, top - i * 9 - 9, W, 9, "#ff4d6d");
+          }
+          ctx.globalAlpha = 1;
+        }
+
+        /* 高度计 */
+        const height = Math.max(0, Math.round(-this.player.y / 10));
         text("高度 " + height + " m", HALF, Y(96), 13, "#7a7a94", "center");
+        /* 距岩浆还有多少：给玩家紧迫感 */
+        const dist = Math.max(0, Math.round((bottomLine - this.player.y) / 10));
+        text("岩浆 " + dist + " m", HALF, Y(96) + 18, 12, dist < 14 ? "#ff4d6d" : "#9a9ab4", "center");
         if(this.combo > 1)
-          text(this.combo + " 次完美", HALF, Y(120), 15, "#ffd93d", "center", "#7a5c00");
+          text(this.combo + " 次完美", HALF, Y(120) + 12, 15, "#ffd93d", "center", "#7a5c00");
         if(this.perfectMsg && this.perfectMsg.t > 0){
           ctx.globalAlpha = clamp(this.perfectMsg.t / 0.4, 0, 1);
           text("PERFECT!", HALF, H / 2 - 60, 30, "#ffd93d", "center", "#7a5c00");
           ctx.globalAlpha = 1;
         }
-        text("按住蓄力 · 松手起跳 · 落在正中间加倍", HALF, H - 40, 11, "#5a5a76", "center");
+        text("按住蓄力 · 松手起跳 · 会自动吸附下一个平台", HALF, H - 40, 11, "#5a5a76", "center");
       }
     };
   }
 };
-
 /* ======================================================================
    主循环
    ====================================================================== */
@@ -1867,7 +1722,7 @@ resize();
 /* 支持 URL hash 直达，便于分享与调试：
    #home            -> 游戏列表
    #game/sort       -> 直接进入某款游戏
-   #game/arrow/3    -> 从第 3 关开始                                     */
+   #game/jump/3     -> 从第 3 关开始                                     */
 function routeFromHash(){
   const h = (location.hash || "").replace(/^#\/?/, "");
   if(!h || h === "title") return App.go("title");
@@ -1925,3 +1780,9 @@ if("serviceWorker" in navigator){
 </script>
 </body>
 </html>
+
+
+
+
+
+

@@ -42,6 +42,23 @@ for(const f of MUST_BE_RELATIVE){
 }
 if(!absFound) ok("index.html / sw.js / manifest 中无绝对路径，可安全部署到任意子目录");
 
+/* ---- 2b. BOM 检查 ----
+   UTF-8 BOM 会让 manifest.webmanifest 解析失败（JSON 不允许开头有 BOM），
+   也可能导致 sw.js 注册失败。用 PowerShell 改文件很容易带上，必须查。 */
+{
+  let bomFound = 0;
+  for(const f of ["index.html", "sw.js", "manifest.webmanifest"]){
+    const p = path.join(root, f);
+    if(!fs.existsSync(p)) continue;
+    const b = fs.readFileSync(p);
+    if(b.length >= 3 && b[0] === 0xEF && b[1] === 0xBB && b[2] === 0xBF){
+      bomFound++;
+      bad(f + " 带 UTF-8 BOM —— manifest 会解析失败、SW 可能注册不上");
+    }
+  }
+  if(!bomFound) ok("三个核心文件均无 BOM");
+}
+
 /* ---- 3. manifest 完整性 ---- */
 console.log("\n3) PWA manifest");
 try {

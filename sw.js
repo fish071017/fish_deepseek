@@ -4,7 +4,7 @@
      · 静态资源  → stale-while-revalidate（先给缓存，后台静默更新）
    全部使用相对路径 + self.registration.scope，因此部署在子目录
    （例如 https://user.github.io/pixel-arcade/）也能正常工作。 */
-const VERSION = "pixel-arcade-v4";
+const VERSION = "pixel-arcade-v5";
 const CORE = [
   "./",
   "./index.html",
@@ -114,3 +114,4 @@ self.addEventListener("fetch", (e) => {
     return res || new Response("", { status: 504, statusText: "offline" });
   })());
 });
+
