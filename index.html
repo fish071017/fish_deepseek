@@ -60,6 +60,9 @@ const LW = 360;
 let W = LW, H = 640;
 let HALF = W / 2;
 const LS_KEY = "pixelArcade.v1";
+/* 构建版本：改动后请同步递增，并在 sw.js 里改 VERSION。
+   用 ?debug=1 打开首页就能看到，用来确认手机拿到的不是旧缓存。 */
+const BUILD = "v4-2024-fix";
 
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 const lerp  = (a, b, t) => a + (b - a) * t;
@@ -231,6 +234,9 @@ function resize(){
   }
   cssW = Math.round(cssW); cssH = Math.round(cssH);
 
+  /* 只有尺寸真正变化时才写 canvas.width/height —— 赋值会清空整个画布。
+     手机上地址栏收起/弹出会频繁触发 resize，若无条件赋值，
+     画面会被反复清空，表现为"突然一片空白"（比如箭头全都不见了）。 */
   const bufW = Math.max(1, Math.floor(cssW * dpr));
   const bufH = Math.max(1, Math.floor(cssH * dpr));
   if(canvas.width !== bufW) canvas.width = bufW;
@@ -502,10 +508,11 @@ Scenes.home = {
     if(location.search.indexOf("debug") >= 0){
       const dy = this.hintY() + 22;
       const ctl = ("serviceWorker" in navigator) && navigator.serviceWorker.controller ? "有" : "无";
-      text("PWA: " + PWA.status + " | controller:" + ctl + " | " + PWA.detail, 8, dy, 9, "#7cffb2", "left");
+      text("构建 " + BUILD, 8, dy, 9, "#ff9f45", "left");
+      text("PWA: " + PWA.status + " | controller:" + ctl + " | " + PWA.detail, 8, dy + 13, 9, "#7cffb2", "left");
       text("viewport " + W + "x" + H + " | css " + canvas.clientWidth + "x" + canvas.clientHeight +
-           " | dpr " + (window.devicePixelRatio || 1) + " | " + location.protocol, 8, dy + 13, 9, "#4dd2ff", "left");
-      text("scope path: " + (location.pathname || "/"), 8, dy + 26, 9, "#ffd93d", "left");
+           " | dpr " + (window.devicePixelRatio || 1) + " | " + location.protocol, 8, dy + 26, 9, "#4dd2ff", "left");
+      text("path: " + (location.pathname || "/"), 8, dy + 39, 9, "#ffd93d", "left");
     }
     Fx.drawParticles(ctx);
   }
@@ -910,7 +917,8 @@ Games.sort = {
           p.t += dt * 4.2;
           if(p.t >= 1){
             const from = this.tubes[p.from], to = this.tubes[p.to];
-            for(let i = 0; i < p.n; i++) to.blocks.push(from.blocks.pop());
+            /* 把动画开始时取出的方块原值放回去 */
+            for(const b of p.moving) to.blocks.push(b);
             this.pouring = null;
             Sfx.place(); buzz(12); Fx.addShake(2);
             const c = this.topColor(to);
@@ -970,9 +978,12 @@ Games.sort = {
             }
             const n = Math.min(this.topRun(from), this.CAP - to.blocks.length);
             this.snapshot();
-            this.pouring = { from: this.sel, to: hit, n, t: 0, color: cf };
-            /* 预扣除：动画结束时统一推入 */
-            for(let i = 0; i < n; i++) from.blocks.pop();
+            /* 必须先把方块值取出来存好。
+               不能存"数量 n"、等动画结束再 pop n 次 —— 那样拿到的是已经被移走之后
+               的栈顶，会 push 进 undefined，渲染成黑色且颜色永不匹配（死局）。 */
+            const moving = [];
+            for(let i = 0; i < n; i++) moving.push(from.blocks.pop());
+            this.pouring = { from: this.sel, to: hit, moving, t: 0, color: cf };
             this.sel = -1;
           }
         }
@@ -1053,7 +1064,7 @@ Games.sort = {
           const tx = to.x + to.w / 2, ty = to.y - 16;
           const cx = lerp(fx, tx, e), cy = Math.min(fy, ty) - Math.sin(e * Math.PI) * 60;
           /* 飞行块 */
-          for(let i = 0; i < p.n; i++){
+          for(let i = 0; i < p.moving.length; i++){
             const off = i * 9;
             block(cx - 6 + off * 0.3, cy - i * 4, 13, 13, col, "rgba(255,255,255,.4)", "rgba(0,0,0,.3)");
           }
@@ -1153,7 +1164,9 @@ Games.arrow = {
           if(!opts.length) continue;
           const [dx, dy] = pick(opts);
           grid[r][c] = {
-            dx, dy, alive: true, spawn: 0, blockT: 0,
+            /* spawn 直接置 1：入场动画会让箭头在最初 ~0.4s 内尺寸为 0，
+               手机上加载偏慢时很容易看到"空盘面"，以为没有箭头。 */
+            dx, dy, alive: true, spawn: 1, blockT: 0,
             color: dx === 1 ? 0 : dx === -1 ? 1 : dy === 1 ? 2 : 3
           };
           placed++;
@@ -1393,15 +1406,20 @@ Games.arrow = {
 };
 /* ======================================================================
    游戏 H：一指点色 TAP DASH
-   规则：4 条轨道，方块从上方落下。点某条轨道 = 摧毁该轨道最下方方块。
-        方块触底即结束。同色连击加分。
-   难度：折磨优先。第 10 秒起速度暴涨，容错窗口极小。
+   规则：四种颜色的方块从上方落下。判定线下方有一排颜色按钮，
+        点某个颜色按钮 → 消除当前所有轨道里"最下面一个该颜色的方块"。
+        颜色对不上就是空点，弹提示音并断连击。
+        任何方块越过判定线即结束。
+   难度：折磨优先。速度随时间上涨，越到后面越来不及看清颜色。
    ====================================================================== */
+const DASH_COLORS = ["#ff4d6d", "#4dd2ff", "#ffd93d", "#7cffb2"];
+
 Games.dash = {
   create(){
     return {
       LANES: 4,
-      lanes: [],         // 每条轨道一个方块数组
+      BH: 46,            // 方块高度
+      lanes: [],         // 每条轨道一个方块数组（lane[0] 是最靠下的）
       laneW: 0,
       speed: 0,
       spawnT: 0,
@@ -1409,9 +1427,11 @@ Games.dash = {
       combo: 0,
       maxCombo: 0,
       elapsed: 0,
-      judgeY: 0,
       hitFx: [],
+      missFx: [],
       lastColor: -1,
+      dead: false,
+      t: 0,
       init(app){
         this.app = app;
         this.LANES = 4;
@@ -1420,34 +1440,42 @@ Games.dash = {
         this.speed = 92;
         this.spawnT = 0.5;
         this.score = 0; this.combo = 0; this.maxCombo = 0; this.elapsed = 0;
-        this.judgeY = H - 150;
-        this.hitFx = [];
+        this.hitFx = []; this.missFx = [];
         this.dead = false;
-        this.bh = 46;                      // 方块高度
+        this.t = 0;
+        this.lastColor = -1;
+      },
+      /* 判定线位置：方块越过它就算漏 */
+      judgeY(){ return H - 190; },
+      /* 按钮区域：判定线下方一整块 */
+      btnTop(){ return this.judgeY() + 18; },
+      btnH(){ return Math.min(84, H - this.btnTop() - 22); },
+      btnRect(i){
+        const w = W / 4;
+        return { x: i * w + 7, y: this.btnTop(), w: w - 14, h: this.btnH() };
       },
       update(dt, app){
         if(this.dead) return;
+        this.t += dt;
         this.elapsed += dt;
-        /* 折磨曲线：速度随时间指数上涨，60 秒后几乎不可能 */
+        /* 折磨曲线：速度随时间上涨 */
         this.speed = 92 + Math.pow(this.elapsed, 1.42) * 7.5 + this.elapsed * 12;
         this.spawnT -= dt;
 
-        const spawnGap = Math.max(0.16, 0.78 - this.elapsed * 0.016);
+        const spawnGap = Math.max(0.18, 0.80 - this.elapsed * 0.016);
         if(this.spawnT <= 0){
           this.spawnT = spawnGap * rand(0.82, 1.18);
           this.spawnBlock();
         }
         /* 移动 */
         for(const lane of this.lanes){
-          for(const b of lane){
-            b.y += this.speed * dt;
-            b.wob += dt * 6;
-          }
+          for(const b of lane){ b.y += this.speed * dt; b.wob += dt * 6; }
         }
-        /* 触底判定 */
+        /* 越线判定 */
+        const jy = this.judgeY();
         for(let li = 0; li < this.LANES; li++){
           const lane = this.lanes[li];
-          if(lane.length && lane[0].y + this.bh >= H - 54){
+          if(lane.length && lane[0].y + this.BH >= jy){
             this.dead = true;
             Fx.addShake(18); Sfx.fail(); buzz([40, 50, 80]);
             Fx.flash("#ff4d6d", 0.3);
@@ -1455,64 +1483,90 @@ Games.dash = {
             return;
           }
         }
-        /* 特效 */
+        /* 特效计时 */
         for(let i = this.hitFx.length - 1; i >= 0; i--){
           this.hitFx[i].t += dt;
           if(this.hitFx[i].t > 0.35) this.hitFx.splice(i, 1);
         }
-        /* 输入 */
-        for(const tp of Input.taps){
-          const li = clamp(Math.floor(tp.x / this.laneW), 0, this.LANES - 1);
-          this.tapLane(li, app);
+        for(let i = this.missFx.length - 1; i >= 0; i--){
+          this.missFx[i].t += dt;
+          if(this.missFx[i].t > 0.4) this.missFx.splice(i, 1);
         }
+        /* 输入：只认按钮区 */
+        for(const tp of Input.taps){
+          const bi = this.buttonAt(tp.x, tp.y);
+          if(bi >= 0) this.pressColor(bi);
+        }
+      },
+      buttonAt(x, y){
+        if(y < this.btnTop() || y > this.btnTop() + this.btnH()) return -1;
+        for(let i = 0; i < this.LANES; i++){
+          const r = this.btnRect(i);
+          if(x >= r.x && x <= r.x + r.w) return i;
+        }
+        return -1;
       },
       spawnBlock(){
         const li = randi(0, this.LANES - 1);
         const lane = this.lanes[li];
-        /* 避免同轨堆叠过密导致必死 */
-        if(lane.length >= 3) return;
-        const color = randi(0, 3);
-        lane.push({ y: -this.bh, color, wob: rand(0, 6), lane: li });
+        if(lane.length >= 3) return;              /* 避免同轨堆叠过密导致必死 */
+        lane.push({ y: -this.BH, color: randi(0, 3), wob: rand(0, 6), lane: li });
       },
-      tapLane(li, app){
-        const lane = this.lanes[li];
-        if(!lane.length) { this.combo = 0; Sfx.tap(); return; }
-        /* 摧毁最下方（最接近判定线）的方块 */
-        const b = lane[0];
-        /* 判断是否击中窗口：距离判定线越近分越高 */
-        const dist = (H - 54) - (b.y + this.bh);
-        const near = clamp(1 - dist / 260, 0, 1);
-        lane.shift();
-        const sameColor = b.color === this.lastColor;
+      /* 按下某个颜色按钮：消除所有轨道里最靠下的那个该颜色方块 */
+      pressColor(color){
+        const jy = this.judgeY();
+        let best = null;   // { li, idx, b, dist }
+        for(let li = 0; li < this.LANES; li++){
+          const lane = this.lanes[li];
+          for(let k = 0; k < lane.length; k++){
+            if(lane[k].color !== color) continue;
+            const dist = jy - (lane[k].y + this.BH);   // 离判定线越近越优先
+            if(!best || dist < best.dist) best = { li, idx: k, b: lane[k], dist };
+          }
+        }
+        if(!best){
+          /* 颜色对不上：弹提示音、断连击、按钮闪红 */
+          this.combo = 0;
+          this.lastColor = -1;
+          this.missFx.push({ color, t: 0 });
+          Sfx.fail(); buzz(16); Fx.addShake(3);
+          return;
+        }
+        const lane = this.lanes[best.li];
+        lane.splice(best.idx, 1);
+        const sameColor = color === this.lastColor;
         this.combo = sameColor ? this.combo + 1 : 1;
         this.maxCombo = Math.max(this.maxCombo, this.combo);
-        const pts = Math.round(10 + near * 40) * Math.min(this.combo, 8);
+        const near = clamp(1 - best.dist / 260, 0, 1);
+        const pts = Math.round(10 + near * 40) * Math.min(this.combo, 6);
         this.score += pts;
-        this.lastColor = b.color;
-        const col = ["#ff4d6d", "#4dd2ff", "#ffd93d", "#7cffb2"][b.color];
-        this.hitFx.push({ x: li * this.laneW + this.laneW / 2, y: b.y + this.bh / 2, t: 0, color: col });
-        Fx.burst(li * this.laneW + this.laneW / 2, b.y + this.bh / 2, 10, col, 180);
-        if(this.combo > 1){ Sfx.combo(this.combo); } else Sfx.good();
+        this.lastColor = color;
+        const col = DASH_COLORS[color];
+        const cxp = best.li * this.laneW + this.laneW / 2;
+        const cyp = best.b.y + this.BH / 2;
+        this.hitFx.push({ x: cxp, y: cyp, t: 0, color: col, pts });
+        Fx.burst(cxp, cyp, 10, col, 180);
+        if(this.combo > 1) Sfx.combo(this.combo); else Sfx.good();
         Fx.addShake(2 + near * 4); buzz(near > 0.7 ? 14 : 6);
         if(near > 0.88){ Fx.flash(col, 0.10); Sfx.perfect(); }
       },
       hud(){ return this.score + " 分"; },
       draw(){
+        const jy = this.judgeY();
         /* 轨道背景 */
         for(let i = 0; i < this.LANES; i++){
-          px(i * this.laneW + 2, 0, this.laneW - 4, H, i % 2 ? "#101020" : "#0e0e1c");
+          px(i * this.laneW + 2, TOP_UI, this.laneW - 4, jy - TOP_UI, i % 2 ? "#101020" : "#0e0e1c");
         }
-        /* 判定线 */
-        const jy = H - 54;
-        const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 8);
-        ctx.globalAlpha = 0.55 + pulse * 0.45;
-        px(0, jy, W, 3, "#ff4d6d");
-        ctx.globalAlpha = 1;
-        /* 危险区渐变 */
+        /* 危险区渐变（判定线以上） */
         for(let i = 0; i < 12; i++){
           ctx.globalAlpha = 0.03 + i * 0.012;
           px(0, jy - i * 8 - 8, W, 8, "#ff4d6d");
         }
+        ctx.globalAlpha = 1;
+        /* 判定线 */
+        const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 8);
+        ctx.globalAlpha = 0.55 + pulse * 0.45;
+        px(0, jy, W, 3, "#ff4d6d");
         ctx.globalAlpha = 1;
 
         /* 方块 */
@@ -1520,9 +1574,8 @@ Games.dash = {
           for(const b of lane){
             const x = b.lane * this.laneW + 5;
             const w = this.laneW - 10;
-            const col = ["#ff4d6d", "#4dd2ff", "#ffd93d", "#7cffb2"][b.color];
-            block(x, b.y, w, this.bh, col, "rgba(255,255,255,.35)", "rgba(0,0,0,.35)");
-            /* 内部像素装饰 */
+            const col = DASH_COLORS[b.color];
+            block(x, b.y, w, this.BH, col, "rgba(255,255,255,.35)", "rgba(0,0,0,.35)");
             px(x + 6, b.y + 8, w - 12, 3, "rgba(255,255,255,.25)");
           }
         }
@@ -1533,15 +1586,39 @@ Games.dash = {
           px(f.x - 30, f.y, 60, 2, f.color);
           px(f.x - 20, f.y - 6, 40, 2, f.color);
           px(f.x - 20, f.y + 6, 40, 2, f.color);
-          text("+" + Math.round(a * 40), f.x, f.y - 20, 12, f.color, "center");
+          text("+" + (f.pts || 10), f.x, f.y - 20, 12, f.color, "center");
           ctx.globalAlpha = 1;
         }
+
+        /* ---- 颜色按钮区 ---- */
+        px(0, this.btnTop() - 10, W, H - this.btnTop() + 10, "#0a0a12");
+        px(0, this.btnTop() - 10, W, 2, "#25253a");
+        for(let i = 0; i < this.LANES; i++){
+          const r = this.btnRect(i);
+          const col = DASH_COLORS[i];
+          const missed = this.missFx.find(m => m.color === i);
+          const flash = missed ? 1 - missed.t / 0.4 : 0;
+          /* 键帽底 */
+          panel(r.x, r.y, r.w, r.h, flash > 0 ? "#3a1a22" : "#16162a",
+                flash > 0 ? "#ff4d6d" : "#3a3a5c", 3);
+          /* 颜色块：一眼识别该按哪个 */
+          const pad = 9;
+          const sw = r.w - pad * 2;
+          const sh = Math.round(r.h * 0.52);
+          const sy = r.y + Math.round((r.h - sh) / 2);
+          block(r.x + pad, sy, sw, sh, col, "rgba(255,255,255,.45)", "rgba(0,0,0,.4)");
+          /* 该颜色当前可消数量，给一点战术信息 */
+          let cnt = 0;
+          for(const lane of this.lanes) for(const b of lane) if(b.color === i) cnt++;
+          if(cnt > 0) text(String(cnt), r.x + r.w / 2, r.y + r.h - 9, 10, "#9a9ab4", "center");
+        }
+
         /* 连击 */
         if(this.combo > 1){
-          text(this.combo + " COMBO", HALF, 96, 20, "#ffd93d", "center", "#7a5c00");
+          text(this.combo + " 连击  ×" + Math.min(this.combo, 6), HALF, TOP_UI + 26, 17, "#ffd93d", "center", "#7a5c00");
         }
-        text("速度 ×" + (this.speed / 92).toFixed(1), 14, H - 30, 11, this.speed > 260 ? "#ff4d6d" : "#5a5a76", "left");
-        text("时长 " + this.elapsed.toFixed(1) + "s", W - 14, H - 30, 11, "#5a5a76", "right");
+        text("速度 ×" + (this.speed / 92).toFixed(1), 12, H - 8, 10, this.speed > 260 ? "#ff4d6d" : "#5a5a76", "left");
+        text(this.elapsed.toFixed(1) + "s", W - 12, H - 8, 10, "#5a5a76", "right");
       }
     };
   }
@@ -1562,8 +1639,14 @@ Games.jump = {
       camY: 0,
       targetCamY: 0,
       score: 0, combo: 0,
-      MAXJUMP: 300,
-      GRAV: 1500,
+      /* 物理参数：用"目标跳跃高度"反推初速度，而不是随手给一个初速度。
+         v = sqrt(2 * g * h)。之前是 v = MAXJUMP*0.62*(...)-120，满蓄力只上升 31px，
+         而平台间距 74px —— 玩家永远跳不上去，必现死局。 */
+      GRAV: 1700,
+      MIN_JUMP_H: 62,        // 短按的跳跃高度
+      MAX_JUMP_H: 150,       // 满蓄力的跳跃高度（> 平台最大间距）
+      MAX_GAP: 120,          // 平台间距上限，必须明显小于满蓄力高度
+      AIR_CTRL: 18,          // 起跳时的水平微调幅度
       over: false,
       init(app){
         this.app = app;
@@ -1579,11 +1662,17 @@ Games.jump = {
         this.score = 0; this.combo = 0; this.over = false;
         this.spawnNext();
       },
+      /* 按蓄力比例算出跳跃初速度（负值 = 向上） */
+      jumpVelocity(charge){
+        const h = lerp(this.MIN_JUMP_H, this.MAX_JUMP_H, clamp(charge, 0, 1));
+        return -Math.sqrt(2 * this.GRAV * h);
+      },
       spawnNext(){
         const last = this.plats[this.plats.length - 1];
         const lv = this.plats.length;
         const w = clamp(this.baseW - lv * 1.6, 26, 96);
-        const gap = clamp(70 + lv * 3.5, 70, 230);
+        /* 间距必须留出余量：满蓄力高度 150，间距最多 120 */
+        const gap = clamp(74 + lv * 3.0, 74, this.MAX_GAP);
         const nx = clamp(last.x + last.w / 2 + rand(-90, 90) - w / 2, 20, W - w - 20);
         const ny = last.y - gap;
         const moving = lv > 6 && Math.random() < clamp(0.15 + lv * 0.03, 0, 0.6);
@@ -1607,8 +1696,9 @@ Games.jump = {
         if(Input.released && this.charging){
           this.charging = false;
           if(p.onGround){
-            p.vy = -this.MAXJUMP * 0.62 * (0.35 + this.charge * 0.65) - 120;
-            p.vx = rand(-18, 18);
+            p.vy = this.jumpVelocity(this.charge);
+            /* 滞空时间固定，左右微调幅度不随蓄力变化，避免空中失控 */
+            p.vx = rand(-this.AIR_CTRL, this.AIR_CTRL);
             p.onGround = false;
             Sfx.good(); buzz(12);
             Fx.addShake(3 + this.charge * 5);
@@ -1707,11 +1797,19 @@ Games.jump = {
           const barW = 60;
           px(p.x - barW / 2, pyr - 16, barW, 5, "#25253a");
           px(p.x - barW / 2, pyr - 16, barW * this.charge, 5, this.charge > 0.85 ? "#ff4d6d" : "#7cffb2");
-          /* 预测落点 */
-          ctx.globalAlpha = 0.25;
-          const dist = this.MAXJUMP * 0.62 * (0.35 + this.charge * 0.65);
-          px(p.x - 12, p.y - dist * 0.55, 24, 3, "#ffd93d");
+          /* 用真实物理画抛物线预测 —— 让玩家看得出要蓄多少力才够到下一个平台 */
+          const v0 = this.jumpVelocity(this.charge);
+          ctx.globalAlpha = 0.5;
+          for(let i = 1; i <= 14; i++){
+            const t = i * 0.055;
+            const yy = p.y + v0 * t + 0.5 * this.GRAV * t * t;
+            if(yy > p.y + 8) break;
+            px(p.x - 1, yy, 3, 3, "#ffd93d");
+          }
           ctx.globalAlpha = 1;
+          /* 标出这一跳的最高点，方便判断够不够 */
+          const apex = p.y - (v0 * v0) / (2 * this.GRAV);
+          px(p.x - 8, apex, 16, 2, "#ffd93d");
         }
         block(pxr, pyr, pw, ph, "#7cffb2", "rgba(255,255,255,.45)", "rgba(0,0,0,.4)");
         /* 眼睛（像素） */

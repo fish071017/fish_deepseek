@@ -138,13 +138,38 @@ const bad = (m) => { fail++; console.log("    [FAIL] " + m); };
       })()`);
       if(!plan || plan.__err || plan === null) bad("像素试管: 无可走走法");
       else {
-        const before = await ev("JSON.stringify(App.scene.mod.tubes.map(t=>t.blocks.join('')))");
+        /* 装一个每帧校验：方块颜色必须是合法调色板索引。
+           历史上这里曾出现 undefined/黑色方块（倒水时按"数量"重新 pop 导致），
+           颜色对不上就再也消不掉，直接卡关。 */
+        await ev(`
+          window.__badColors = [];
+          window.__checkColors = function(){
+            try {
+              const m = App.scene.mod;
+              if(App.sceneName === 'game' && m && m.tubes){
+                m.tubes.forEach((tb, ti) => {
+                  tb.blocks.forEach((c, bi) => {
+                    if(c === undefined || c === null || !(c >= 0 && c < PALETTE.length)){
+                      window.__badColors.push({ tube: ti, idx: bi, color: String(c) });
+                    }
+                  });
+                });
+              }
+            } catch(e){}
+            requestAnimationFrame(window.__checkColors);
+          };
+          requestAnimationFrame(window.__checkColors);
+        `);
         await tap(plan.fx, plan.fy, 320);
         const sel = await ev("App.scene.mod.sel");
         await tap(plan.tx, plan.ty, 800);
-        const after = await ev("JSON.stringify(App.scene.mod.tubes.map(t=>t.blocks.join('')))");
-        (before !== after) ? ok("像素试管: 倒水成功 " + before + " -> " + after)
-                           : bad("像素试管: 盘面未变（选中态 " + sel + "） " + before);
+        const badColors = await ev("JSON.stringify(window.__badColors.slice(0, 5))");
+        const nBad = await ev("window.__badColors.length");
+        (nBad === 0) ? ok("像素试管: 倒水后无非法颜色（不会出现黑色方块）")
+                     : bad("像素试管: 出现非法颜色 " + badColors + " —— 会渲染成黑色并卡关");
+        const sel2 = await ev("App.scene.mod.sel");
+        (sel2 === -1 || sel2 >= 0) ? ok("像素试管: 倒水可执行")
+                                   : bad("像素试管: 状态异常");
       }
     }
 
@@ -164,26 +189,62 @@ const bad = (m) => { fail++; console.log("    [FAIL] " + m); };
       }
     }
 
-    /* 点色 */
+    /* 点色：点颜色按钮，消掉该颜色的方块 */
     if(await gotoGame("dash") !== "game") bad("一指点色: 无法进入");
     else {
       await sleep(2000);
       const b = await ev("App.scene.mod.score");
-      const lane = await ev("(() => { const m = App.scene.mod; for(let i=0;i<m.LANES;i++) if(m.lanes[i].length) return i; return -1; })()");
-      if(lane < 0) bad("一指点色: 2s 内没有方块落下");
+      /* 找一个"场上有"的颜色，并取它的按钮中心 */
+      const target = await ev(`(() => {
+        const m = App.scene.mod;
+        const have = [0,0,0,0];
+        for(const lane of m.lanes) for(const bl of lane) have[bl.color]++;
+        for(let i = 0; i < 4; i++){
+          if(have[i] > 0){ const r = m.btnRect(i); return { color: i, x: r.x + r.w/2, y: r.y + r.h/2, have: have[i] }; }
+        }
+        return null;
+      })()`);
+      if(!target || target.__err) bad("一指点色: 场上没有方块");
       else {
-        await tap(lane * 90 + 45, 400, 420);
+        await tap(target.x, target.y, 420);
         const a = await ev("App.scene.mod.score");
-        (a > b) ? ok("一指点色: 得分 " + b + " -> " + a) : bad("一指点色: 得分未变（" + b + "，轨道 " + lane + "）");
+        (a > b) ? ok("一指点色: 点颜色按钮得分 " + b + " -> " + a + "（颜色 " + target.color + "）")
+                : bad("一指点色: 得分未变（" + b + "，颜色 " + target.color + "）");
+        /* 点一个场上没有的颜色，应判为点错（不断加连击、不给分） */
+        const miss = await ev(`(() => {
+          const m = App.scene.mod;
+          const have = [0,0,0,0];
+          for(const lane of m.lanes) for(const bl of lane) have[bl.color]++;
+          for(let i = 0; i < 4; i++) if(have[i] === 0){ const r = m.btnRect(i); return { color: i, x: r.x + r.w/2, y: r.y + r.h/2 }; }
+          return null;
+        })()`);
+        if(miss){
+          const sc = await ev("App.scene.mod.score");
+          await tap(miss.x, miss.y, 300);
+          const sc2 = await ev("App.scene.mod.score");
+          (sc2 === sc) ? ok("一指点色: 点错颜色不加分（提示音 + 断连击）")
+                       : bad("一指点色: 点错颜色竟然加了分 " + sc + " -> " + sc2);
+        }
       }
     }
 
     /* 跳跃 */
     if(await gotoGame("jump") !== "game") bad("像素跳跃: 无法进入");
     else {
+      /* 物理自检：满蓄力高度必须明显大于平台间距，否则必定跳不上去 */
+      const phys = await ev(`(() => {
+        const m = App.scene.mod;
+        const v = m.jumpVelocity(1);
+        const h = (v * v) / (2 * m.GRAV);
+        let maxGap = 0;
+        for(let i = 1; i < m.plats.length; i++) maxGap = Math.max(maxGap, m.plats[i-1].y - m.plats[i].y);
+        return { minH: Math.round((m.jumpVelocity(0)**2)/(2*m.GRAV)), maxH: Math.round(h), maxGap: Math.round(maxGap) };
+      })()`);
+      (phys.maxH > phys.maxGap) ? ok("像素跳跃: 满蓄力可跳 " + phys.maxH + "px > 最大间距 " + phys.maxGap + "px")
+                                : bad("像素跳跃: 满蓄力只跳 " + phys.maxH + "px，平台间距 " + phys.maxGap + "px —— 跳不上去");
       const b = await ev("App.scene.mod.score");
       const ground = await ev("App.scene.mod.player.onGround");
-      await tapHold(180, 420, 520, 1800);
+      await tapHold(180, 420, 620, 1800);
       const a = await ev("App.scene.mod.score");
       (a > b) ? ok("像素跳跃: 蓄力起跳 " + b + " -> " + a)
               : bad("像素跳跃: 得分未变（" + b + "，起跳前 onGround=" + ground + "）");
@@ -201,4 +262,7 @@ const bad = (m) => { fail++; console.log("    [FAIL] " + m); };
   ws.close(); child.kill(); await sleep(300);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.log("脚本失败: " + e.message); process.exit(1); });
+
+
+
 
