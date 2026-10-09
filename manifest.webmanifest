@@ -1,7 +1,7 @@
 {
   "name": "像素街机 PIXEL ARCADE",
   "short_name": "像素街机",
-  "description": "四款像素风手机小游戏：像素试管、箭头开路、一指点色、像素跳跃。难度不友好，慎入。",
+  "description": "三款像素风手机小游戏：像素试管、一指点色、像素跳跃。难度不友好，慎入。",
   "start_url": "./index.html",
   "scope": "./",
   "display": "fullscreen",
